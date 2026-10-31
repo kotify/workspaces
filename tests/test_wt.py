@@ -4,6 +4,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import socket
 import subprocess
 import sys
 from collections.abc import Callable
@@ -216,6 +217,114 @@ def save(record: wt.Record) -> None:
         state.worktrees[record.path] = record
 
 
+def ignore(*args: object, **kwargs: object) -> None:
+    return None
+
+
+def record_at(tmp_path: Path, **fields: Any) -> wt.Record:
+    values: dict[str, Any] = {
+        "repo": str(tmp_path / "app"),
+        "name": "feat-x",
+        "path": str(tmp_path / "app-wt" / "feat-x"),
+        "branch": "feat/x",
+        "status": "ready",
+        "created_at": wt.now(),
+    }
+    return wt.Record(**{**values, **fields})
+
+
+def rm(tmp_path: Path, *, force: bool = False) -> None:
+    wt.cmd_rm(argparse.Namespace(repo=tmp_path / "app", name="feat-x", force=force))
+
+
+def test_rm_refuses_untracked_files_that_git_status_hides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    record = record_at(tmp_path)
+    subprocess.run(["git", "init", "--quiet", record.path], check=True)
+    subprocess.run(
+        ["git", "-C", record.path, "config", "status.showUntrackedFiles", "no"],
+        check=True,
+    )
+    (Path(record.path) / "scratch").write_text("work")
+    save(record)
+    monkeypatch.setattr(wt, "close_rex_session", ignore)
+    monkeypatch.setattr(wt, "stop_stack", ignore)
+
+    with pytest.raises(wt.WtError, match="scratch"):
+        rm(tmp_path)
+
+
+def test_rm_refuses_while_wt_new_is_still_creating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    record = record_at(tmp_path, status="creating", pid=os.getpid())
+    Path(record.path).mkdir(parents=True)
+    save(record)
+
+    with pytest.raises(wt.WtError, match="still creating"):
+        rm(tmp_path)
+
+    assert Path(record.path).exists()
+
+
+def test_rm_closes_the_rex_session_of_a_worktree_deleted_by_hand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    save(record_at(tmp_path, rex_session="session:1"))
+    closed: list[str | None] = []
+
+    def close(record: wt.Record) -> None:
+        closed.append(record.rex_session)
+
+    monkeypatch.setattr(wt, "close_rex_session", close)
+
+    rm(tmp_path)
+
+    assert closed == ["session:1"]
+
+
+def test_socket_path_prefers_the_socket_the_stack_started_on(tmp_path: Path):
+    started = tmp_path / "started.sock"
+    started.touch()
+    record = record_at(tmp_path, socket=str(started))
+    Path(record.path).mkdir(parents=True)
+    (Path(record.path) / ".wt.toml").write_text('[stack]\nsocket = "other.sock"\n')
+
+    assert wt.socket_path(record) == started
+
+
+def test_stop_stack_fails_when_the_server_stops_answering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    answers: list[list[dict[str, Any]] | None] = [[{"name": "postgres"}]]
+
+    def processes(record: wt.Record, *, strict: bool = False):
+        if answers:
+            return answers.pop()
+        if strict:
+            raise wt.StackUnreachable("EOF")
+        return None
+
+    monkeypatch.setattr(wt, "processes", processes)
+    monkeypatch.setattr(wt, "process_compose", ignore)
+    monkeypatch.setattr(wt.time, "sleep", ignore)
+
+    with pytest.raises(wt.WtError, match="still running"):
+        wt.stop_stack(record_at(tmp_path))
+
+
+def test_listening_sees_servers_on_ipv6_localhost():
+    with socket.socket(socket.AF_INET6) as server:
+        server.bind(("::1", 0))
+        server.listen()
+
+        assert wt.listening(server.getsockname()[1])
+
+
 def test_rm_refuses_a_dirty_worktree_before_stopping_anything(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -248,9 +357,7 @@ def test_rm_refuses_a_dirty_worktree_before_stopping_anything(
     assert stopped == []
 
 
-def test_read_state_drops_unknown_fields(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_state_keeps_unknown_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     (tmp_path / "wt").mkdir()
     (tmp_path / "wt" / "state.json").write_text(
@@ -273,9 +380,15 @@ def test_read_state_drops_unknown_fields(
     )
 
     state = wt.read_state()
+    with wt.locked_state():
+        pass
 
     assert state.worktrees["/src/api-wt/x"].name == "x"
     assert state.repos["/src/api"].base_port == 8200
+    # A newer wt's fields survive a write by an older one.
+    saved = json.loads((tmp_path / "wt" / "state.json").read_text())
+    assert saved["worktrees"]["/src/api-wt/x"]["retired_field"] == 1
+    assert saved["repos"]["/src/api"]["retired_field"] == 1
 
 
 def test_read_state_refuses_a_newer_format(
@@ -328,7 +441,7 @@ def test_skill_install_and_remove_leave_other_skills_alone(tmp_path: Path):
 
 
 def test_config_falls_back_to_the_main_checkout_when_the_branch_copy_is_broken(
-    tmp_path: Path,
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
     repo, path = tmp_path / "app", tmp_path / "app-wt" / "feat-x"
     for checkout, text in ((repo, '[install]\ncommand = "main"\n'), (path, "[nope]\n")):
@@ -344,6 +457,8 @@ def test_config_falls_back_to_the_main_checkout_when_the_branch_copy_is_broken(
     )
 
     assert record.config().install == "main"
+    assert record.config().install == "main"
+    assert capsys.readouterr().err.count("ignoring") == 1
 
 
 @pytest.mark.parametrize(
@@ -351,6 +466,8 @@ def test_config_falls_back_to_the_main_checkout_when_the_branch_copy_is_broken(
     [
         ({"status": "Running", "is_ready": "Ready"}, "done"),
         ({"status": "Running", "is_ready": "Not Ready"}, "pending"),
+        ({"status": "Running", "is_ready": "-", "has_ready_probe": True}, "pending"),
+        ({"status": "Running", "is_ready": "-", "has_ready_probe": False}, "done"),
         ({"status": "Pending"}, "pending"),
         ({"status": "Completed", "exit_code": 0}, "done"),
         ({"status": "Completed", "exit_code": 1}, "failed"),

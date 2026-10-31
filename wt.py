@@ -216,6 +216,9 @@ def parse_config(text: str) -> Config:
     )
 
 
+_ignored_configs: set[Path] = set()
+
+
 def load_config(*checkouts: Path) -> Config:
     """The config of the first checkout that has a valid one, or the defaults.
 
@@ -232,7 +235,9 @@ def load_config(*checkouts: Path) -> Config:
         except WtError as error:
             if i == len(checkouts) - 1:
                 raise
-            log(f"wt: ignoring {checkout / CONFIG_FILE}: {error}")
+            if checkout not in _ignored_configs:
+                _ignored_configs.add(checkout)
+                log(f"wt: ignoring {checkout / CONFIG_FILE}: {error}")
     return Config()
 
 
@@ -257,6 +262,8 @@ class Record:
     start_commit: str | None = None
     created_branch: bool = False
     rex_session: str | None = None
+    pid: int | None = None  # the `wt new` creating it
+    socket: str | None = None  # where `wt up` last started the stack
 
     @property
     def repo_name(self) -> str:
@@ -280,6 +287,8 @@ class Repo:
 class State:
     worktrees: dict[str, Record]  # by path
     repos: dict[str, Repo]  # by main checkout path
+    # The file as read, so fields from another wt version survive a write.
+    raw: dict[str, Any] = field(default_factory=dict[str, Any])
 
     def find(self, repo: Path, name: str) -> Record:
         for record in self.worktrees.values():
@@ -302,9 +311,10 @@ def locked_state() -> Generator[State]:
         tmp.write_text(
             json.dumps(
                 {
+                    **state.raw,
                     "version": STATE_VERSION,
-                    "worktrees": {k: asdict(v) for k, v in state.worktrees.items()},
-                    "repos": {k: asdict(v) for k, v in state.repos.items()},
+                    "worktrees": merged(state.raw, "worktrees", state.worktrees),
+                    "repos": merged(state.raw, "repos", state.repos),
                 },
                 indent=2,
             )
@@ -326,6 +336,7 @@ def read_state() -> State:
     return State(
         worktrees={path: Record(**known(v, Record)) for path, v in worktrees.items()},
         repos={path: Repo(**known(v, Repo)) for path, v in repos.items()},
+        raw=raw,
     )
 
 
@@ -333,6 +344,14 @@ def known(values: dict[str, Any], cls: type[Record | Repo]) -> dict[str, Any]:
     """values without the fields a newer or older wt wrote."""
     names = {f.name for f in fields(cls)}
     return {k: v for k, v in values.items() if k in names}
+
+
+def merged(
+    raw: dict[str, Any], section: str, items: dict[str, Record] | dict[str, Repo]
+) -> dict[str, dict[str, Any]]:
+    """items as JSON, over the fields another wt version wrote for them."""
+    old: dict[str, dict[str, Any]] = raw.get(section, {})
+    return {key: {**old.get(key, {}), **asdict(item)} for key, item in items.items()}
 
 
 @contextlib.contextmanager
@@ -405,9 +424,16 @@ def port_range() -> range:
 
 
 def listening(port: int) -> bool:
-    with socket.socket() as probe:
-        probe.settimeout(0.2)
-        return probe.connect_ex(("127.0.0.1", port)) == 0
+    # Both loopbacks: on macOS, Node servers on `localhost` listen on ::1 only.
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family) as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex((host, port)) == 0:
+                    return True
+        except OSError:  # no IPv6
+            continue
+    return False
 
 
 def block_free(block: range) -> bool:
@@ -508,8 +534,18 @@ def exec_argv(path: str, command: list[str]) -> list[str]:
 
 
 def socket_path(record: Record) -> Path | None:
+    """The stack's socket: where `wt up` started it, or where the config says.
+
+    The recorded one comes first, so a branch that changes stack.socket, or a broken
+    config, can't make a running stack look stopped.
+    """
     stack = record.config().stack
-    return None if stack is None else Path(record.path) / stack.socket
+    candidates = [Path(record.socket)] if record.socket else []
+    if stack is not None:
+        candidates.append(Path(record.path) / stack.socket)
+    if not candidates:
+        return None
+    return next((c for c in candidates if c.exists()), candidates[0])
 
 
 def process_compose(record: Record, *args: str) -> subprocess.CompletedProcess[str]:
@@ -548,8 +584,11 @@ def processes(record: Record, *, strict: bool = False) -> list[dict[str, Any]] |
 
 def process_state(process: dict[str, Any]) -> str:
     status = process.get("status", "?")
-    # Processes without a readiness probe report is_ready "-".
-    if status == "Running" and process.get("is_ready") not in ("Ready", "-", "", None):
+    ready = process.get("is_ready")
+    # is_ready is "-" both without a probe and before a probe's first check; older
+    # process-compose versions don't report has_ready_probe.
+    probed = process.get("has_ready_probe", ready not in ("-", "", None))
+    if status == "Running" and probed and ready != "Ready":
         return "Starting"
     return status
 
@@ -570,9 +609,11 @@ def stop_stack(record: Record) -> None:
         return
     log(f"Stopping the stack in {record.path}")
     process_compose(record, "down")
+    # Only a gone server counts as stopped; one that doesn't answer may still run.
     for _ in range(60):
-        if processes(record) is None:
-            return
+        with contextlib.suppress(StackUnreachable):
+            if processes(record, strict=True) is None:
+                return
         time.sleep(1)
     raise WtError(f"the stack in {record.path} is still running after 60s")
 
@@ -610,8 +651,15 @@ def rex(*args: str, command: tuple[str, ...] = ()) -> dict[str, Any]:
 
 
 def close_rex_session(record: Record) -> None:
+    if record.rex_session is None:
+        return
     sessions = rex_session_ids()
-    if sessions and record.rex_session in sessions:
+    if sessions is None:
+        log(
+            f"wt: can't reach Rex to close {record.label}'s session; if it still runs, "
+            f"close it with `rex kill {record.rex_session}`"
+        )
+    elif record.rex_session in sessions:
         log(f"Closing Rex session {record.label}")
         run(["rex", "--autostart=false", "kill", record.rex_session], quiet=True)
 
@@ -730,6 +778,7 @@ def cmd_new(args: argparse.Namespace) -> None:
             branch=args.branch,
             status="creating",
             created_at=now(),
+            pid=os.getpid(),
         )
         if config.ports is not None:
             record.port_block = config.ports.block
@@ -791,6 +840,9 @@ def create(
     record.start_commit = run(
         ["git", "-C", str(path), "rev-parse", "HEAD"], quiet=True
     ).stdout.strip()
+    # Saved now, so `wt rm` after a killed `wt new` deletes the branch it created.
+    with locked_state() as state:
+        state.worktrees[record.path] = record
 
     # [ports] comes from the main checkout, like the allocation; the rest from the branch.
     config = record.config()
@@ -826,6 +878,7 @@ def create(
         run(exec_argv(str(path), shlex.split(config.install)), cwd=path)
 
     record.status = "ready"
+    record.pid = None
     with locked_state() as state:
         state.worktrees[record.path] = record
 
@@ -871,7 +924,7 @@ def ready_record(repo: Path, name: str) -> Record:
     record = read_state().find(repo, name)
     if record.status != "ready":
         raise WtError(
-            f"{record.label} is still {record.status}; if its `wt new` died, `wt rm` it"
+            f"{record.label} is still {record.status}; if its `wt new` stopped, `wt rm` it"
         )
     return record
 
@@ -886,6 +939,9 @@ def cmd_up(args: argparse.Namespace) -> None:
     path = Path(record.path)
     if processes(record) is None:
         log(f"Starting {', '.join(wanted)} in {path}")
+        with locked_state() as state:
+            record.socket = str(path / stack.socket)
+            state.worktrees[record.path].socket = record.socket
         run(exec_argv(str(path), [*shlex.split(stack.start), *wanted]), cwd=path)
     else:
         for process in wanted:
@@ -1015,7 +1071,12 @@ def cmd_rex(args: argparse.Namespace) -> None:
 
 
 def refuse_dirty(path: Path, *, force: bool) -> None:
-    dirty = run(["git", "-C", str(path), "status", "--porcelain"], quiet=True)
+    # --untracked-files=all: status.showUntrackedFiles=no would hide them, and git's own
+    # check before `worktree remove` respects it too.
+    dirty = run(
+        ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=all"],
+        quiet=True,
+    )
     if dirty.stdout.strip() and not force:
         raise WtError(
             f"{path} has uncommitted changes; commit them or pass --force:\n"
@@ -1023,9 +1084,25 @@ def refuse_dirty(path: Path, *, force: bool) -> None:
         )
 
 
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    else:
+        return True
+
+
 def cmd_rm(args: argparse.Namespace) -> None:
     record = read_state().find(args.repo, args.name)
     path = Path(record.path)
+    if record.status == "creating" and record.pid is not None and alive(record.pid):
+        raise WtError(
+            f"`wt new` (pid {record.pid}) is still creating {record.label}; wait for it "
+            "or stop it first"
+        )
     if record.status == "ready" and path.exists():
         # Checked before and after stopping: a dirty worktree keeps its agents and stack,
         # and nothing can write after the second check.
@@ -1042,6 +1119,7 @@ def cmd_rm(args: argparse.Namespace) -> None:
         log(f"Removed the unfinished worktree {path}")
         return
     if not path.exists():
+        close_rex_session(record)
         # Deleted by hand: git still counts its branch as checked out until it prunes.
         with repo_lock(Path(record.repo)):
             run(
@@ -1089,7 +1167,8 @@ metadata:
 <!-- Installed by `wt skill install`. Remove it with `wt skill remove`. -->
 
 Run `wt skill show {name}` and follow the guide it prints. The guide comes from the `wt`
-on PATH, so it matches that version.
+on PATH, so it matches that version. If `wt` isn't on PATH, the current repo doesn't use
+wt, or its dev shell isn't loaded; skip this skill.
 """
 
 
@@ -1269,7 +1348,7 @@ Example: wt rex feat-x -- claude -p --permission-mode acceptEdits "$(cat task.md
 Refuses when the worktree has uncommitted or untracked changes unless --force,
 before it touches anything. Then closes the worktree's Rex session, stops its
 stack, checks again, and removes the worktree. Without --force, git's own checks
-also apply. Removes a worktree whose `wt new` died.""",
+also apply. Removes a worktree whose `wt new` stopped, and refuses while it runs.""",
     )
     rm.add_argument("name")
     rm.add_argument("--force", action="store_true", help="discard uncommitted changes")
