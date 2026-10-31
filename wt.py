@@ -595,6 +595,21 @@ def process_outcome(process: dict[str, Any] | None) -> str:
     return "done" if state in ("Running", "Completed") else "pending"
 
 
+def up_failure(name: str, failed: list[str], procs: dict[str, dict[str, Any]]) -> str:
+    """Why `wt up` failed, pointing at the logs of the process that failed first: often
+    a dependency, such as a setup step that made the requested process skip."""
+    others = [
+        p for p, process in procs.items()
+        if p not in failed and process_outcome(process) == "failed"
+    ]  # fmt: skip
+    if not others:
+        return f"{', '.join(failed)} stopped; see `wt logs {name} {failed[0]}`"
+    return (
+        f"{', '.join(failed)} stopped; {', '.join(others)} failed: "
+        f"see `wt logs {name} {others[0]}`"
+    )
+
+
 def stop_stack(record: Record) -> None:
     if processes(record, strict=True) is None:
         return
@@ -945,9 +960,7 @@ def cmd_up(args: argparse.Namespace) -> None:
         outcomes = {p: process_outcome(procs.get(p)) for p in wanted}
         failed = [p for p in wanted if outcomes[p] == "failed"]
         if failed:
-            raise WtError(
-                f"{', '.join(failed)} stopped; see `wt logs {record.name} {failed[0]}`"
-            )
+            raise WtError(up_failure(record.name, failed, procs))
         pending = [p for p in wanted if outcomes[p] == "pending"]
         if not pending:
             break
@@ -1323,7 +1336,7 @@ the left that runs COMMAND like `wt exec`; it stays open after COMMAND exits, so
 work. If the worktree's session exists, only another agent pane is added, below
 the last one. Prints
 {"session_id": ..., "blocks": {"shell": ..., "stack": ..., "agent": ...}}.
-Example: wt rex feat-x -- claude -p --permission-mode acceptEdits "$(cat task.md)\"""",
+Example: wt rex feat-x -- claude --permission-mode auto "$(cat task.md)\"""",
     )
     rex_.add_argument("name")
     rex_.add_argument(

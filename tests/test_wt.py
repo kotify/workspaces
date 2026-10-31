@@ -471,3 +471,21 @@ def test_config_falls_back_to_the_main_checkout_when_the_branch_copy_is_broken(
 )
 def test_process_outcome(process: dict[str, Any] | None, outcome: str):
     assert wt.process_outcome(process) == outcome
+
+
+def test_up_failure_points_at_the_dependency_that_failed():
+    procs = {
+        "postgres": {"name": "postgres", "status": "Skipped"},
+        "postgres-init": {
+            "name": "postgres-init",
+            "status": "Completed",
+            "exit_code": 1,
+        },
+        "redis": {"name": "redis", "status": "Running", "is_ready": "Ready"},
+    }
+
+    message = wt.up_failure("sentry", ["postgres"], procs)
+
+    assert message == (
+        "postgres stopped; postgres-init failed: see `wt logs sentry postgres-init`"
+    )
