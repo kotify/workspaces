@@ -85,7 +85,9 @@ start process-compose detached with its API on `socket`, and the repo's ports mu
 the block. wt reads the main checkout's own port from a literal `export VAR=<number>` line,
 to keep worktrees off it.
 
-Port blocks come from the range in $WT_PORT_RANGE (default 8300-9999), shared by all repos.
+Port blocks come from the range in $WT_PORT_RANGE (default 8300-9999), shared by all repos,
+aligned to the block size rounded up to 10. Size the block to the repo's highest port
+offset plus one: smaller blocks leave room for more worktrees.
 State lives in $XDG_STATE_HOME/wt (default ~/.local/state/wt)."""
 
 
@@ -429,9 +431,10 @@ def allocate_port_block(
     pool: range,
     is_free: Callable[[range], bool] = block_free,
 ) -> int:
-    # Aligned blocks first, so ports are easy to read; any free block when none fits.
-    step = max(100, size)
-    first = -(-pool.start // step) * step
+    # Blocks aligned to their size, rounded up to 10, first, so ports are easy to read;
+    # any free block when none fits.
+    step = -(-size // 10) * 10
+    first = -(-pool.start // 10) * 10
     aligned = range(first, pool.stop - size + 1, step)
     unaligned = range(pool.start, pool.stop - size + 1)
     for base in [*aligned, *(b for b in unaligned if b not in aligned)]:

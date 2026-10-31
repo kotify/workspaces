@@ -145,6 +145,14 @@ def test_allocate_port_block_probes_the_whole_block():
     assert probed == [range(8300, 8400)]
 
 
+def test_allocate_port_block_aligns_small_blocks_to_their_size():
+    taken = [range(8300, 8330), range(8330, 8340)]
+
+    port = wt.allocate_port_block(taken, 30, pool=range(8300, 10000), is_free=bool)
+
+    assert port == 8360
+
+
 def test_allocate_port_block_falls_back_to_unaligned_blocks():
     assert wt.allocate_port_block([], 100, pool=range(8301, 8401), is_free=bool) == 8301
 
