@@ -1,0 +1,1329 @@
+#!/usr/bin/env python3
+"""Create, run, and remove git worktrees that each have their own ports and stack.
+
+Each worktree lives in `<repo>-wt/<name>` next to the repo's main checkout. A repo describes what
+its worktrees need in an optional `.wt.toml`: a port block written to the worktree's `.envrc`, an
+install command, and a process-compose stack. Without the file, wt manages plain worktrees. wt
+records every worktree of every repo in one state file, so port blocks never collide and
+parallel runs are safe. Commands act on the repo of the current directory; `-C DIR` selects
+another.
+
+Typical use:
+  wt new feat/some-branch --json     create worktree feat-some-branch
+  wt up feat-some-branch             start the stack's default processes, wait until they run
+  wt exec feat-some-branch -- make test
+  wt rm feat-some-branch             close its Rex session, stop the stack, remove the worktree
+
+Don't create these worktrees with `git worktree add`, and don't edit their port variable. Each
+running stack costs memory: start only the processes a task needs, and `wt down` idle worktrees.
+Everything except `wt rex` works in any terminal. Commands that describe worktrees or servers
+print JSON with `--json`. Run `wt config` for the `.wt.toml` reference and `wt COMMAND --help`
+for details.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from collections.abc import Callable, Generator
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+HERE = Path(__file__).resolve().parent
+VERSION = (HERE / "VERSION").read_text().strip()
+CONFIG_FILE = ".wt.toml"
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# sockaddr_un.sun_path is 104 bytes on macOS (108 on Linux), including the trailing NUL.
+MAX_SOCKET_PATH = 103
+FAILED_STATES = ("Completed", "Error", "Skipped", "Terminating")
+CLIENT_COMMANDS = {
+    "analyze", "attach", "completion", "down", "graph", "help", "info", "list",
+    "namespace", "process", "project", "recipe", "version",
+}  # fmt: skip
+# process-compose's global flags that take a separate value.
+VALUE_FLAGS = {
+    "-f", "--config", "-u", "--unix-socket", "-p", "--port", "-a", "--address",
+    "-L", "--log-file", "-n", "--namespace", "-e", "--env", "--ordered-shutdown-timeout",
+}  # fmt: skip
+
+CONFIG_HELP = f"""\
+A repo describes its worktrees in {CONFIG_FILE} at its root. Every key is optional;
+these are the defaults:
+
+  [git]
+  remote = "origin"     # fetched before `wt new`
+  base = ""             # start point of new branches; "" = the remote's default branch
+  fetch = true          # false: use local refs only
+
+  [install]
+  command = ""          # run in the new worktree's environment; "" = no install step
+
+  [ports]               # absent: no port block and no .envrc rewrite
+  var = "PROJECT_BASE_PORT"
+  block = 100           # wt reserves and probes base .. base+block-1
+
+  [stack]               # absent: no stack; `wt up` and `wt rex` have nothing to start
+  start = "app.start -D"                       # wt appends the process names
+  processes = []                               # started by every `wt up`
+  socket = ".direnv/.pc/process-compose.sock"  # where the process-compose server listens
+
+wt reads [git] from the main checkout and the rest from the worktree's own copy, falling back
+to the main checkout's. With [ports], the main checkout's `.envrc` must exist and be ignored by
+git: wt copies it into the worktree with `export VAR=<base>` and checks the effective value with
+`direnv exec`. Without [ports], an ignored `.envrc` is copied as is. With [stack], `start` must
+start process-compose detached with its API on `socket`, and the repo's ports must stay inside
+the block. wt reads the main checkout's own port from a literal `export VAR=<number>` line,
+to keep worktrees off it.
+
+Port blocks come from the range in $WT_PORT_RANGE (default 8300-9999), shared by all repos.
+State lives in $XDG_STATE_HOME/wt (default ~/.local/state/wt)."""
+
+
+class WtError(Exception):
+    pass
+
+
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def run(
+    args: list[str], *, cwd: Path | None = None, check: bool = True, quiet: bool = False
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE if quiet else sys.stderr,
+            stderr=subprocess.PIPE if quiet else None,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise WtError(f"`{args[0]}` isn't installed or isn't on PATH") from None
+    if check and result.returncode != 0:
+        detail = f": {result.stderr.strip()}" if quiet and result.stderr else ""
+        raise WtError(
+            f"`{shlex.join(args)}` failed with exit code {result.returncode}{detail}"
+        )
+    return result
+
+
+def now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def path_bytes(path: Path) -> int:
+    return len(os.fsencode(path))
+
+
+# Config.
+
+
+@dataclass(frozen=True)
+class GitConfig:
+    remote: str = "origin"
+    base: str = ""
+    fetch: bool = True
+
+
+@dataclass(frozen=True)
+class PortsConfig:
+    var: str = "PROJECT_BASE_PORT"
+    block: int = 100
+
+
+@dataclass(frozen=True)
+class StackConfig:
+    start: str = "app.start -D"
+    processes: tuple[str, ...] = ()
+    socket: str = ".direnv/.pc/process-compose.sock"
+
+
+@dataclass(frozen=True)
+class Config:
+    git: GitConfig = field(default_factory=GitConfig)
+    install: str = ""
+    ports: PortsConfig | None = None
+    stack: StackConfig | None = None
+
+
+def _section(
+    raw: dict[str, Any], name: str, keys: dict[str, type]
+) -> dict[str, Any] | None:
+    section = raw.get(name)
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise WtError(f"{CONFIG_FILE}: [{name}] must be a table")
+    values: dict[str, Any] = section  # pyright: ignore[reportUnknownVariableType]
+    for key, value in values.items():
+        expected = keys.get(key)
+        if expected is None:
+            raise WtError(f"{CONFIG_FILE}: unknown key {name}.{key}")
+        if not isinstance(value, expected) or (
+            expected is int and isinstance(value, bool)
+        ):
+            raise WtError(f"{CONFIG_FILE}: {name}.{key} must be {expected.__name__}")
+    return values
+
+
+def parse_config(text: str) -> Config:
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise WtError(f"{CONFIG_FILE}: {error}") from None
+    unknown = set(raw) - {"git", "install", "ports", "stack"}
+    if unknown:
+        raise WtError(f"{CONFIG_FILE}: unknown section {min(unknown)}")
+    git = _section(raw, "git", {"remote": str, "base": str, "fetch": bool}) or {}
+    install = _section(raw, "install", {"command": str}) or {}
+    ports = _section(raw, "ports", {"var": str, "block": int})
+    stack = _section(raw, "stack", {"start": str, "processes": list, "socket": str})
+    if ports is not None:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ports.get("var", "X")):
+            raise WtError(f"{CONFIG_FILE}: ports.var must be a variable name")
+        if not 1 <= ports.get("block", 100) <= 1000:
+            raise WtError(f"{CONFIG_FILE}: ports.block must be between 1 and 1000")
+    stack_config = None
+    if stack is not None:
+        processes: list[Any] = stack.get("processes", [])
+        if not all(isinstance(p, str) for p in processes):
+            raise WtError(f"{CONFIG_FILE}: stack.processes must be a list of names")
+        defaults = StackConfig()
+        stack_config = StackConfig(
+            start=stack.get("start", defaults.start),
+            processes=tuple(processes),
+            socket=stack.get("socket", defaults.socket),
+        )
+    return Config(
+        git=GitConfig(**git),
+        install=install.get("command", ""),
+        ports=None if ports is None else PortsConfig(**ports),
+        stack=stack_config,
+    )
+
+
+def load_config(*checkouts: Path) -> Config:
+    """The config of the first checkout that has one, or the defaults."""
+    for checkout in checkouts:
+        with contextlib.suppress(FileNotFoundError):
+            return parse_config((checkout / CONFIG_FILE).read_text())
+    return Config()
+
+
+# State: every worktree wt manages, across repos, with its port block and Rex session.
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(base) / "wt"
+
+
+@dataclass
+class Record:
+    repo: str  # the main checkout's path
+    name: str
+    path: str
+    branch: str
+    status: str  # creating or ready
+    created_at: str
+    base_port: int | None = None
+    port_block: int = 0
+    start_commit: str | None = None
+    created_branch: bool = False
+    rex_session: str | None = None
+
+    @property
+    def repo_name(self) -> str:
+        return Path(self.repo).name
+
+    @property
+    def label(self) -> str:
+        return f"{self.repo_name}:{self.name}"
+
+    def config(self) -> Config:
+        return load_config(Path(self.path), Path(self.repo))
+
+
+@dataclass
+class Repo:
+    base_port: int | None = None  # the main checkout's own
+    port_block: int = 0
+
+
+@dataclass
+class State:
+    worktrees: dict[str, Record]  # by path
+    repos: dict[str, Repo]  # by main checkout path
+
+    def find(self, repo: Path, name: str) -> Record:
+        for record in self.worktrees.values():
+            if record.repo == str(repo) and record.name == name:
+                return record
+        raise WtError(f"no worktree {name!r} in {repo}; see `wt ls`")
+
+
+@contextlib.contextmanager
+def locked_state() -> Generator[State]:
+    """The state, saved on exit. Holds an exclusive lock, so keep the block short."""
+    directory = state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "state.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_state()
+        yield state
+        path = directory / "state.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "worktrees": {k: asdict(v) for k, v in state.worktrees.items()},
+                    "repos": {k: asdict(v) for k, v in state.repos.items()},
+                },
+                indent=2,
+            )
+        )
+        tmp.replace(path)
+
+
+def read_state() -> State:
+    try:
+        raw: dict[str, Any] = json.loads((state_dir() / "state.json").read_text())
+    except FileNotFoundError:
+        raw = {}
+    worktrees: dict[str, dict[str, Any]] = raw.get("worktrees", {})
+    repos: dict[str, dict[str, Any]] = raw.get("repos", {})
+    return State(
+        worktrees={path: Record(**fields) for path, fields in worktrees.items()},
+        repos={path: Repo(**fields) for path, fields in repos.items()},
+    )
+
+
+# Repos and ports.
+
+
+def main_checkout(directory: Path) -> Path:
+    common = run(
+        [
+            "git", "-C", str(directory), "rev-parse",
+            "--path-format=absolute", "--git-common-dir",
+        ],
+        quiet=True,
+    )  # fmt: skip
+    git_dir = Path(common.stdout.strip())
+    if git_dir.name != ".git":
+        raise WtError(
+            f"{git_dir} isn't a checkout's .git directory; wt supports repos whose main "
+            "checkout holds .git, not bare repos, submodules, or separate git dirs"
+        )
+    return git_dir.parent
+
+
+def worktree_root(repo: Path) -> Path:
+    return repo.parent / f"{repo.name}-wt"
+
+
+def port_line_re(var: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"""^[ \t]*(?:export[ \t]+)?{re.escape(var)}=["']?(\d*)["']?[ \t]*(?:\#.*)?$""",
+        re.MULTILINE,
+    )
+
+
+def parse_port(envrc: str, var: str) -> int | None:
+    ports = [m[1] for m in port_line_re(var).finditer(envrc)]
+    return int(ports[-1]) if ports and ports[-1] else None
+
+
+def read_port(checkout: Path, var: str) -> int | None:
+    try:
+        return parse_port((checkout / ".envrc").read_text(), var)
+    except OSError:
+        return None
+
+
+def set_port(envrc: str, var: str, base_port: int) -> str:
+    """The .envrc with exactly one assignment of var, before everything else."""
+    rest = port_line_re(var).sub("", envrc)
+    return f"export {var}={base_port}\n{rest}"
+
+
+def port_range() -> range:
+    spec = os.environ.get("WT_PORT_RANGE", "8300-9999")
+    match = re.fullmatch(r"(\d+)-(\d+)", spec)
+    if not match or not 1024 <= int(match[1]) < int(match[2]) <= 65535:
+        raise WtError(f"WT_PORT_RANGE must look like 8300-9999, not {spec!r}")
+    return range(int(match[1]), int(match[2]) + 1)
+
+
+def listening(port: int) -> bool:
+    with socket.socket() as probe:
+        probe.settimeout(0.2)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def block_free(block: range) -> bool:
+    return not any(listening(port) for port in block)
+
+
+def taken_blocks(state: State) -> list[range]:
+    """Port ranges in use by wt worktrees and the main checkouts of every known repo."""
+    owners: list[Record | Repo] = [*state.worktrees.values(), *state.repos.values()]
+    return [
+        range(owner.base_port, owner.base_port + owner.port_block)
+        for owner in owners
+        if owner.base_port is not None
+    ]
+
+
+def allocate_port_block(
+    taken: list[range],
+    size: int,
+    *,
+    pool: range,
+    is_free: Callable[[range], bool] = block_free,
+) -> int:
+    # Aligned blocks first, so ports are easy to read; any free block when none fits.
+    step = max(100, size)
+    first = -(-pool.start // step) * step
+    aligned = range(first, pool.stop - size + 1, step)
+    unaligned = range(pool.start, pool.stop - size + 1)
+    for base in [*aligned, *(b for b in unaligned if b not in aligned)]:
+        block = range(base, base + size)
+        overlaps = any(
+            block.start < other.stop and other.start < block.stop for other in taken
+        )
+        if not overlaps and is_free(block):
+            return base
+    raise WtError("no free port block; remove a worktree with `wt rm`")
+
+
+def worktree_name(branch: str, root: Path, socket_suffix: str | None) -> str:
+    """The branch as a name, shortened with a hash when a socket path would be too long."""
+    name = re.sub(r"[^a-z0-9-]+", "-", branch.lower()).strip("-") or "worktree"
+    if socket_suffix is None:
+        return name
+    room = MAX_SOCKET_PATH - path_bytes(root / socket_suffix) - 1
+    if room < 12:
+        raise WtError(
+            f"{root} is too deep for the stack's socket {socket_suffix}: socket paths "
+            f"must stay under {MAX_SOCKET_PATH} bytes"
+        )
+    if len(name) > room:
+        digest = hashlib.sha1(branch.encode()).hexdigest()[:6]  # noqa: S324
+        name = f"{name[: room - 7].rstrip('-')}-{digest}"
+    return name
+
+
+def check_name(name: str, root: Path, socket_suffix: str | None) -> None:
+    if not NAME_RE.match(name):
+        raise WtError(f"invalid name {name!r}; use lowercase letters, digits, and -")
+    if socket_suffix is None:
+        return
+    sock = root / name / socket_suffix
+    if path_bytes(sock) > MAX_SOCKET_PATH:
+        raise WtError(
+            f"name {name!r} is too long: the socket path {sock} would exceed "
+            f"{MAX_SOCKET_PATH} bytes; pass a shorter --name"
+        )
+
+
+def envrc_ignored(repo: Path) -> bool:
+    is_tracked = run(
+        ["git", "-C", str(repo), "ls-files", "--error-unmatch", ".envrc"],
+        check=False,
+        quiet=True,
+    )
+    is_ignored = run(
+        ["git", "-C", str(repo), "check-ignore", "-q", ".envrc"],
+        check=False,
+        quiet=True,
+    )
+    return is_tracked.returncode != 0 and is_ignored.returncode == 0
+
+
+# Running commands in a worktree.
+
+
+def exec_argv(path: str, command: list[str]) -> list[str]:
+    """Run command in the worktree's direnv environment when it has an .envrc."""
+    # Through sh: scripts without a shebang fail with "exec format error" under a direct exec.
+    shell = ["sh", "-c", '"$@"', "sh", *command]
+    if not (Path(path) / ".envrc").exists():
+        return shell
+    # DEVSHELL_NO_MOTD: numtide devshells print their command menu on every entry.
+    return ["env", "DEVSHELL_NO_MOTD=1", "direnv", "exec", path, *shell]
+
+
+# Stacks.
+
+
+def socket_path(record: Record) -> Path | None:
+    stack = record.config().stack
+    return None if stack is None else Path(record.path) / stack.socket
+
+
+def process_compose(record: Record, *args: str) -> subprocess.CompletedProcess[str]:
+    sock = socket_path(record)
+    if sock is None:
+        raise WtError(f"{record.label} has no [stack] in {CONFIG_FILE}")
+    return run(
+        ["process-compose", "--unix-socket", str(sock), "--use-uds", *args],
+        check=False,
+        quiet=True,
+    )
+
+
+class StackUnreachable(WtError):
+    pass
+
+
+def processes(record: Record, *, strict: bool = False) -> list[dict[str, Any]] | None:
+    """The stack's processes, or None without a stack or when no server listens.
+
+    With strict, a server that listens but doesn't answer raises StackUnreachable instead.
+    """
+    sock = socket_path(record)
+    if sock is None or not sock.exists():
+        return None
+    result = process_compose(record, "process", "list", "-o", "json")
+    if result.returncode == 0:
+        return json.loads(result.stdout or "[]")
+    gone = re.search(r"connection refused|no such file", result.stderr, re.IGNORECASE)
+    if strict and not gone:
+        raise StackUnreachable(
+            f"the stack at {sock} doesn't answer: {result.stderr.strip()}"
+        )
+    return None
+
+
+def process_state(process: dict[str, Any]) -> str:
+    status = process.get("status", "?")
+    # Processes without a readiness probe report is_ready "-".
+    if status == "Running" and process.get("is_ready") not in ("Ready", "-", "", None):
+        return "Starting"
+    return status
+
+
+def stop_stack(record: Record) -> None:
+    if processes(record, strict=True) is None:
+        return
+    log(f"Stopping the stack in {record.path}")
+    process_compose(record, "down")
+    for _ in range(60):
+        if processes(record) is None:
+            return
+        time.sleep(1)
+    raise WtError(f"the stack in {record.path} is still running after 60s")
+
+
+def stack_config(record: Record) -> StackConfig:
+    stack = record.config().stack
+    if stack is None:
+        raise WtError(
+            f"{record.label} has no [stack] in {CONFIG_FILE}; see `wt config`"
+        )
+    return stack
+
+
+# Rex.
+
+
+def rex_session_ids() -> set[str] | None:
+    """IDs of live Rex sessions, or None outside Rex."""
+    if not shutil.which("rex"):
+        return None
+    result = run(
+        ["rex", "--autostart=false", "--timeout", "3s", "ls", "--json"],
+        check=False,
+        quiet=True,
+    )
+    if result.returncode != 0:
+        return None
+    return {s["session_id"] for s in json.loads(result.stdout)["sessions"]}
+
+
+def rex(*args: str, command: tuple[str, ...] = ()) -> dict[str, Any]:
+    tail = ["--", *command] if command else []
+    result = run(["rex", "--autostart=false", *args, "--json", *tail], quiet=True)
+    return json.loads(result.stdout)
+
+
+def close_rex_session(record: Record) -> None:
+    sessions = rex_session_ids()
+    if sessions and record.rex_session in sessions:
+        log(f"Closing Rex session {record.label}")
+        run(["rex", "--autostart=false", "kill", record.rex_session], quiet=True)
+
+
+# Worktree commands.
+
+
+def describe(record: Record, sessions: set[str] | None) -> dict[str, Any]:
+    procs = processes(record)
+    return {
+        "name": record.name,
+        "repo": record.repo,
+        "path": record.path,
+        "branch": record.branch,
+        "status": record.status,
+        "base_port": record.base_port,
+        "start_commit": record.start_commit,
+        "stack": (
+            None
+            if procs is None
+            else {
+                p["name"]: state
+                for p in procs
+                if (state := process_state(p)) != "Disabled"
+            }
+        ),
+        "rex_session": (
+            record.rex_session
+            if sessions is not None and record.rex_session in sessions
+            else None
+        ),
+    }
+
+
+def print_worktrees(records: list[Record], *, as_json: bool, all_repos: bool) -> None:
+    sessions = rex_session_ids()
+    described = [describe(r, sessions) for r in records]
+    if as_json:
+        print(json.dumps(described, indent=2))
+        return
+    print(f"{'NAME':<32}  {'PORT':<5}  {'BRANCH':<36}  STACK")
+    for wt in described:
+        name = f"{Path(wt['repo']).name}:{wt['name']}" if all_repos else wt["name"]
+        stack = wt["stack"]
+        state = (
+            wt["status"]
+            if wt["status"] != "ready"
+            else "-"
+            if stack is None
+            else ",".join(f"{n}:{s}" for n, s in sorted(stack.items()))
+        )
+        port = wt["base_port"] or "-"
+        print(f"{name:<32}  {port:<5}  {wt['branch']:<36}  {state}")
+
+
+def default_base(repo: Path, git: GitConfig) -> str:
+    if git.base:
+        return git.base
+    head = run(
+        [
+            "git", "-C", str(repo), "symbolic-ref", "--short",
+            f"refs/remotes/{git.remote}/HEAD",
+        ],
+        check=False,
+        quiet=True,
+    ).stdout.strip()  # fmt: skip
+    if head:
+        return head
+    current = run(
+        ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], quiet=True
+    ).stdout.strip()
+    log(f"{git.remote}/HEAD isn't set; starting new branches from {current}")
+    return current
+
+
+def cmd_new(args: argparse.Namespace) -> None:
+    repo: Path = args.repo
+    config = load_config(repo)
+    root = worktree_root(repo)
+    socket_suffix = config.stack.socket if config.stack else None
+    name = args.name or worktree_name(args.branch, root, socket_suffix)
+    check_name(name, root, socket_suffix)
+    path = root / name
+    if config.ports is not None:
+        if not (repo / ".envrc").is_file():
+            raise WtError(
+                f"{CONFIG_FILE} has [ports], but {repo} has no .envrc to copy"
+            )
+        if not envrc_ignored(repo):
+            raise WtError(
+                f"{CONFIG_FILE} has [ports], so .envrc must be ignored by git: wt "
+                "writes a different port into each worktree's copy"
+            )
+
+    if config.git.fetch:
+        run(["git", "-C", str(repo), "fetch", "--quiet", config.git.remote])
+    base = args.base or default_base(repo, config.git)
+    main_port = read_port(repo, config.ports.var) if config.ports else None
+    if config.ports and main_port is None:
+        log(
+            f"wt can't read a literal `export {config.ports.var}=<number>` in "
+            f"{repo}/.envrc, so it can't keep worktrees off the main checkout's ports"
+        )
+    with locked_state() as state:
+        state.repos[str(repo)] = Repo(
+            base_port=main_port,
+            port_block=config.ports.block if config.ports else 0,
+        )
+        if path.exists() or str(path) in state.worktrees:
+            raise WtError(f"{path} already exists")
+        record = Record(
+            repo=str(repo),
+            name=name,
+            path=str(path),
+            branch=args.branch,
+            status="creating",
+            created_at=now(),
+        )
+        if config.ports is not None:
+            record.port_block = config.ports.block
+            record.base_port = allocate_port_block(
+                taken_blocks(state), config.ports.block, pool=port_range()
+            )
+        state.worktrees[record.path] = record
+
+    try:
+        create(
+            record,
+            base=base,
+            remote=config.git.remote,
+            ports=config.ports,
+            install=args.install,
+        )
+    except BaseException:
+        log(f"Rolling back {path}")
+        rollback(record)
+        raise
+    if config.ports is None and config.stack is None and not config.install:
+        log(
+            f"No {CONFIG_FILE}: a plain worktree without ports or stack; see `wt config`"
+        )
+    print_worktrees([record], as_json=args.json, all_repos=False)
+
+
+def create(
+    record: Record,
+    *,
+    base: str,
+    remote: str,
+    ports: PortsConfig | None,
+    install: bool,
+) -> None:
+    repo, path = Path(record.repo), Path(record.path)
+
+    def has_ref(ref: str) -> bool:
+        return (
+            run(
+                ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref],
+                check=False,
+                quiet=True,
+            ).returncode
+            == 0
+        )
+
+    if has_ref(f"refs/heads/{record.branch}"):
+        add = [record.branch]
+    elif has_ref(f"refs/remotes/{remote}/{record.branch}"):
+        add = ["--track", "-b", record.branch, f"{remote}/{record.branch}"]
+        record.created_branch = True
+    else:
+        add = ["--no-track", "-b", record.branch, base]
+        record.created_branch = True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "-C", str(repo), "worktree", "add", "--quiet", str(path), *add])
+    record.start_commit = run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], quiet=True
+    ).stdout.strip()
+
+    # [ports] comes from the main checkout, like the allocation; the rest from the branch.
+    config = record.config()
+    main_envrc, envrc = repo / ".envrc", path / ".envrc"
+    if ports is not None and record.base_port is not None:
+        if not envrc_ignored(path):
+            raise WtError(
+                f"{record.branch} tracks .envrc or doesn't ignore it; with [ports], wt "
+                "writes a different port into each worktree's .envrc"
+            )
+        # A copy, not `source_env`: that would evaluate the main checkout's environment,
+        # with its ports and data.
+        text = set_port(main_envrc.read_text(), ports.var, record.base_port)
+        envrc.write_text(text)
+    elif main_envrc.is_file() and not envrc.exists():
+        shutil.copyfile(main_envrc, envrc)
+    if envrc.exists():
+        run(["direnv", "allow", str(path)])
+    if ports is not None:
+        effective = run(
+            exec_argv(str(path), ["printenv", ports.var]),
+            cwd=path,
+            check=False,
+            quiet=True,
+        ).stdout.strip()
+        if effective != str(record.base_port):
+            raise WtError(
+                f"{envrc} sets {ports.var}={effective or '(unset)'}, "
+                f"not {record.base_port}; check the main checkout's .envrc"
+            )
+    if install and config.install:
+        log(f"Installing in {path}: {config.install}")
+        run(exec_argv(str(path), shlex.split(config.install)), cwd=path)
+
+    record.status = "ready"
+    with locked_state() as state:
+        state.worktrees[record.path] = record
+
+
+def rollback(record: Record) -> None:
+    repo, path = Path(record.repo), Path(record.path)
+    if path.exists():
+        run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
+            check=False,
+            quiet=True,
+        )
+        shutil.rmtree(path, ignore_errors=True)
+    if record.created_branch:
+        run(
+            ["git", "-C", str(repo), "branch", "-D", record.branch],
+            check=False,
+            quiet=True,
+        )
+    with locked_state() as state:
+        state.worktrees.pop(record.path, None)
+
+
+def cmd_ls(args: argparse.Namespace) -> None:
+    records = sorted(
+        (
+            r
+            for r in read_state().worktrees.values()
+            if args.all or r.repo == str(args.repo)
+        ),
+        key=lambda r: (r.repo, r.name),
+    )
+    print_worktrees(records, as_json=args.json, all_repos=args.all)
+
+
+def cmd_info(args: argparse.Namespace) -> None:
+    record = read_state().find(args.repo, args.name)
+    print_worktrees([record], as_json=args.json, all_repos=False)
+
+
+def ready_record(repo: Path, name: str) -> Record:
+    record = read_state().find(repo, name)
+    if record.status != "ready":
+        raise WtError(
+            f"{record.label} is still {record.status}; if its `wt new` died, `wt rm` it"
+        )
+    return record
+
+
+def cmd_up(args: argparse.Namespace) -> None:
+    record = ready_record(args.repo, args.name)
+    stack = stack_config(record)
+    defaults = () if args.only else stack.processes
+    wanted = list(dict.fromkeys([*defaults, *args.processes]))
+    if not wanted:
+        raise WtError("name the processes to start, or set stack.processes")
+    path = Path(record.path)
+    if processes(record) is None:
+        log(f"Starting {', '.join(wanted)} in {path}")
+        run(exec_argv(str(path), [*shlex.split(stack.start), *wanted]), cwd=path)
+    else:
+        for process in wanted:
+            result = process_compose(record, "process", "start", process)
+            if result.returncode != 0 and "already running" not in result.stderr:
+                raise WtError(f"can't start {process}: {result.stderr.strip()}")
+
+    # Waits for process-compose's own state: readiness probes where the repo defines them,
+    # otherwise only that the process runs.
+    deadline = time.monotonic() + args.timeout
+    while True:
+        procs = {p["name"]: p for p in processes(record) or []}
+        states = {name: process_state(p) for name, p in procs.items()}
+        failed = [
+            p
+            for p in wanted
+            if states.get(p) in FAILED_STATES or procs.get(p, {}).get("exit_code")
+        ]
+        if failed:
+            raise WtError(
+                f"{', '.join(failed)} stopped; see `wt logs {record.name} {failed[0]}`"
+            )
+        pending = [p for p in wanted if states.get(p) != "Running"]
+        if not pending:
+            break
+        if time.monotonic() > deadline:
+            raise WtError(
+                f"not ready after {args.timeout}s: "
+                + ", ".join(f"{p} ({states.get(p, 'missing')})" for p in pending)
+                + f"; see `wt logs {record.name} <process>`"
+            )
+        time.sleep(1)
+    print_worktrees([record], as_json=args.json, all_repos=False)
+
+
+def cmd_down(args: argparse.Namespace) -> None:
+    record = read_state().find(args.repo, args.name)
+    stack_config(record)
+    stop_stack(record)
+
+
+def cmd_logs(args: argparse.Namespace) -> None:
+    record = read_state().find(args.repo, args.name)
+    stack_config(record)
+    if processes(record) is None:
+        raise WtError(f"the stack in {record.path} isn't running")
+    result = process_compose(
+        record, "process", "logs", args.process, "--tail", str(args.tail)
+    )
+    sys.stdout.write(result.stdout)
+    if result.returncode != 0:
+        raise WtError(result.stderr.strip())
+
+
+def strip_dashes(command: list[str]) -> list[str]:
+    return command[1:] if command[:1] == ["--"] else command
+
+
+def cmd_exec(args: argparse.Namespace) -> None:
+    record = ready_record(args.repo, args.name)
+    command = strip_dashes(args.command)
+    if not command:
+        raise WtError("pass a command: wt exec NAME -- COMMAND")
+    argv = exec_argv(record.path, command)
+    os.chdir(record.path)
+    try:
+        os.execvp(argv[0], argv)  # noqa: S606
+    except FileNotFoundError:
+        raise WtError(f"`{argv[0]}` isn't installed or isn't on PATH") from None
+
+
+def cmd_rex(args: argparse.Namespace) -> None:
+    record = ready_record(args.repo, args.name)
+    sessions = rex_session_ids()
+    if sessions is None:
+        raise WtError("`wt rex` needs a running Rex server and the rex CLI")
+    agent = strip_dashes(args.agent)
+    path = record.path
+    # Panes run through exec_argv because Rex starts them in the login shell's environment,
+    # without the worktree's.
+    agent_command = tuple(exec_argv(path, agent))
+
+    def split(
+        session: str, anchor: str, side: str, ratio: int, label: str, *command: str
+    ) -> str:
+        created = rex(
+            "split", "-s", session, "-b", anchor, f"--split={side}",
+            "--ratio", str(ratio), "--label", label, "-c", path, "--focus=false",
+            *(["--keep-open"] if label == "agent" else []),
+            command=command,
+        )  # fmt: skip
+        return created["block_ids"][0]
+
+    blocks: dict[str, str] = {}
+    if record.rex_session is not None and record.rex_session in sessions:
+        session_id = record.rex_session
+        # Another agent goes below the last agent pane, or left of everything.
+        listed = rex("block", "ls", "-s", session_id)["blocks"]
+        agents = [b["block_id"] for b in listed if b.get("label") == "agent"]
+        if agent:
+            anchor = agents[-1] if agents else listed[0]["block_id"]
+            side, ratio = ("below", 50) if agents else ("left", 65)
+            blocks["agent"] = split(
+                session_id, anchor, side, ratio, "agent", *agent_command
+            )
+    else:
+        # One tab: the agent (or the shell) on the left, the stack's TUI and the shell
+        # stacked on the right.
+        created = rex("new", record.label, "-c", path, "--window", record.name)
+        session_id: str = created["session_id"]
+        with locked_state() as state:
+            state.worktrees[record.path].rex_session = session_id
+        shell = blocks["shell"] = created["initial_windows"][0]["block_ids"][0]
+        if agent:
+            blocks["agent"] = split(
+                session_id, shell, "left", 65, "agent", *agent_command
+            )
+        sock = socket_path(record)
+        if sock is not None and processes(record) is not None:
+            # The pane starts in the login shell's environment, which may lack the
+            # process-compose that wt itself uses; the socket makes the worktree's own
+            # environment unnecessary.
+            binary = shutil.which("process-compose") or "process-compose"
+            attach = (binary, "attach", "--unix-socket", str(sock), "--use-uds")
+            side, ratio = ("above", 60) if agent else ("right", 40)
+            blocks["stack"] = split(session_id, shell, side, ratio, "stack", *attach)
+    print(json.dumps({"session_id": session_id, "blocks": blocks}, indent=2))
+
+
+def cmd_rm(args: argparse.Namespace) -> None:
+    record = read_state().find(args.repo, args.name)
+    path = Path(record.path)
+    if record.status == "ready" and path.exists():
+        # Agents and the stack stop first, so nothing writes after the dirty check.
+        close_rex_session(record)
+        stop_stack(record)
+        dirty = run(["git", "-C", str(path), "status", "--porcelain"], quiet=True)
+        if dirty.stdout.strip() and not args.force:
+            raise WtError(
+                f"{path} has uncommitted changes; its session and stack are stopped. "
+                f"Commit them or pass --force:\n{dirty.stdout.rstrip()}"
+            )
+        remove = ["git", "-C", record.repo, "worktree", "remove", str(path)]
+        run(remove + (["--force"] if args.force else []))
+    elif path.exists():
+        # A `wt new` that died: nothing in it is the user's yet.
+        rollback(record)
+        log(f"Removed the unfinished worktree {path}")
+        return
+    with locked_state() as state:
+        state.worktrees.pop(record.path, None)
+    log(f"Removed {path}; the branch {record.branch} stays")
+
+
+# Servers: every process-compose server on the machine.
+
+
+@dataclass(frozen=True)
+class Server:
+    pid: int
+    ppid: int
+    age: str
+    socket: str | None
+    cwd: Path | None
+
+    @property
+    def detached(self) -> bool:
+        return self.ppid == 1
+
+    @property
+    def gone(self) -> bool:
+        return self.cwd is None or not self.cwd.is_dir()
+
+    def state(self, managed: set[str]) -> str:
+        if self.gone:
+            return "dir gone"
+        if str(self.cwd) in managed:
+            return "wt"
+        return "detached" if self.detached else "attached"
+
+    def describe(self, managed: set[str]) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "age": self.age,
+            "state": self.state(managed),
+            "dir": str(self.cwd) if self.cwd else None,
+        }
+
+
+def process_cwd(pid: int) -> Path | None:
+    result = run(
+        ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], check=False, quiet=True
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("n"):
+            return Path(line[1:])
+    return None
+
+
+def server_socket(argv: list[str]) -> str | None:
+    for i, arg in enumerate(argv):
+        if arg in ("-u", "--unix-socket") and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--unix-socket="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def is_server(argv: list[str]) -> bool:
+    """A process-compose server: its command is `up`, `run`, or absent."""
+    if Path(argv[0]).name != "process-compose":
+        return False
+    args = iter(argv[1:])
+    for arg in args:
+        if arg in VALUE_FLAGS:
+            next(args, None)
+        elif not arg.startswith("-"):
+            return arg not in CLIENT_COMMANDS
+    return True
+
+
+def servers() -> list[Server]:
+    ps = run(["ps", "-axo", "pid=,ppid=,etime=,command="], quiet=True)
+    found: list[Server] = []
+    for line in ps.stdout.splitlines():
+        pid, ppid, age, command = line.split(None, 3)
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        if is_server(argv):
+            cwd = process_cwd(int(pid))
+            found.append(Server(int(pid), int(ppid), age, server_socket(argv), cwd))
+    return found
+
+
+def print_servers(
+    found: list[Server], managed: set[str], *, as_json: bool = False
+) -> None:
+    described = [server.describe(managed) for server in found]
+    if as_json:
+        print(json.dumps(described, indent=2))
+        return
+    print(f"{'PID':>7}  {'AGE':>12}  {'STATE':<9}  DIR")
+    for s in described:
+        print(f"{s['pid']:>7}  {s['age']:>12}  {s['state']:<9}  {s['dir'] or '?'}")
+
+
+def stop_server(server: Server) -> None:
+    if server.socket and Path(server.socket).exists():
+        run(
+            ["process-compose", "--unix-socket", server.socket, "--use-uds", "down"],
+            check=False,
+            quiet=True,
+        )
+    else:
+        # Started without a socket API: SIGTERM also stops its processes.
+        os.kill(server.pid, signal.SIGTERM)
+    for _ in range(60):
+        try:
+            os.kill(server.pid, 0)
+        except ProcessLookupError:
+            log(f"Stopped {server.pid} ({server.cwd or '?'})")
+            return
+        time.sleep(1)
+    log(f"{server.pid} is still running after 60s")
+
+
+def managed_paths() -> set[str]:
+    return set(read_state().worktrees)
+
+
+def cmd_ps(args: argparse.Namespace) -> None:
+    print_servers(servers(), managed_paths(), as_json=args.json)
+
+
+def cmd_prune(args: argparse.Namespace) -> None:
+    found, managed = servers(), managed_paths()
+    targets = (
+        [s for s in found if s.pid in args.pids]
+        if args.pids
+        else [s for s in found if s.gone or (s.detached and s.state(managed) != "wt")]
+    )
+    if not targets:
+        log("Nothing to stop.")
+        return
+    print_servers(targets, managed)
+    if not args.yes and input("\nStop these? [y/N] ").strip().lower() != "y":
+        return
+    for server in targets:
+        stop_server(server)
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    if args.repo is None:
+        print(CONFIG_HELP)
+        return
+    print(json.dumps(asdict(load_config(args.repo)), indent=2))
+
+
+def cmd_skills(args: argparse.Namespace) -> None:
+    print(HERE / "skills")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="wt",
+        description=(__doc__ or "").splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="\n".join((__doc__ or "").splitlines()[2:]),
+    )
+    parser.add_argument("--version", action="version", version=f"wt {VERSION}")
+    parser.add_argument("-C", dest="directory", help="act on the repo of DIRECTORY")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def add(
+        name: str,
+        handler: Callable[[argparse.Namespace], None],
+        help: str,
+        details: str = "",
+        *,
+        with_json: bool = False,
+    ) -> argparse.ArgumentParser:
+        command = commands.add_parser(
+            name,
+            help=help,
+            description=f"{help[0].upper()}{help[1:]}.\n\n{details}".strip(),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        command.set_defaults(handler=handler)
+        if with_json:
+            command.add_argument("--json", action="store_true", help="print JSON")
+        return command
+
+    new = add(
+        "new",
+        cmd_new,
+        "create a worktree for a branch",
+        f"""\
+Fetches the remote, then checks out the local branch, tracks REMOTE/BRANCH, or
+creates BRANCH from --base (default: git.base, else the remote's default branch).
+With [ports], copies the main checkout's .envrc with the next free port block and
+checks the effective value. Then runs `direnv allow` and install.command.
+Parallel runs are safe. On failure it removes what it created.
+The name is --name, or the branch with `/` replaced by `-`, shortened with a hash
+when the stack's socket path would exceed the macOS limit. See `wt config` for
+{CONFIG_FILE}.""",
+        with_json=True,
+    )
+    new.add_argument(
+        "branch", help="existing branch, or a new one to create from --base"
+    )
+    new.add_argument("--name", help="worktree name (default: from the branch)")
+    new.add_argument("--base", help="start point of a new branch")
+    new.add_argument(
+        "--no-install",
+        dest="install",
+        action="store_false",
+        help="skip install.command",
+    )
+
+    describe_help = """\
+JSON fields: name, repo, path, branch, status (creating or ready), base_port
+(null without [ports]; the repo's ports are base_port + offsets inside the block),
+start_commit (HEAD when the worktree was created; review work with
+`git diff START`), stack (process name to state; null when stopped or without a
+stack; disabled processes omitted), and rex_session (the live Rex session's ID,
+or null)."""
+    ls = add("ls", cmd_ls, "list worktrees", describe_help, with_json=True)
+    ls.add_argument("--all", action="store_true", help="include every repo")
+    info = add("info", cmd_info, "describe a worktree", describe_help, with_json=True)
+    info.add_argument("name")
+
+    up = add(
+        "up",
+        cmd_up,
+        "start the stack and wait until it runs",
+        """\
+Runs stack.start with stack.processes and the named processes, or starts the
+named processes in a running stack, then waits for process-compose's state and
+fails as soon as one of them stops. Processes with a readiness probe are Running
+once they answer; for the others, Running means only that they started.
+Process names are those in `process-compose process list`.""",
+        with_json=True,
+    )
+    up.add_argument("name")
+    up.add_argument("processes", nargs="*", help="processes beyond stack.processes")
+    up.add_argument(
+        "--only", action="store_true", help="start only the named processes"
+    )
+    up.add_argument("--timeout", type=int, default=300, help="seconds to wait")
+
+    add("down", cmd_down, "stop the stack").add_argument("name")
+
+    logs = add("logs", cmd_logs, "print a process's recent logs")
+    logs.add_argument("name")
+    logs.add_argument("process")
+    logs.add_argument("--tail", type=int, default=200)
+
+    exec_ = add(
+        "exec",
+        cmd_exec,
+        "run a command in a worktree",
+        """\
+Runs COMMAND in the worktree's directory and, when it has an .envrc, its direnv
+environment, and exits with its status. Example: wt exec feat-x -- make test""",
+    )
+    exec_.add_argument("name")
+    exec_.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND")
+
+    rex_ = add(
+        "rex",
+        cmd_rex,
+        "open the worktree in a Rex session",
+        """\
+Creates the Rex session REPO:NAME with one tab: a shell and, when the stack runs,
+a pane with the process-compose TUI. With `-- COMMAND`, adds an agent pane on
+the left that runs COMMAND like `wt exec`; it stays open after COMMAND exits, so
+`rex wait` returns COMMAND's exit status. Use the shell pane for interactive
+work. If the worktree's session exists, only another agent pane is added, below
+the last one. Prints
+{"session_id": ..., "blocks": {"shell": ..., "stack": ..., "agent": ...}}.
+Example: wt rex feat-x -- claude -p --permission-mode acceptEdits "$(cat task.md)\"""",
+    )
+    rex_.add_argument("name")
+    rex_.add_argument(
+        "agent", nargs=argparse.REMAINDER, help="-- COMMAND to run in an agent pane"
+    )
+
+    rm = add(
+        "rm",
+        cmd_rm,
+        "close the session, stop the stack, remove the worktree; keep the branch",
+        """\
+Closes the worktree's Rex session and stops its stack first, then refuses when
+the worktree has uncommitted or untracked changes unless --force. Without
+--force, git's own checks also apply. Removes a worktree whose `wt new` died.""",
+    )
+    rm.add_argument("name")
+    rm.add_argument("--force", action="store_true", help="discard uncommitted changes")
+
+    add(
+        "ps",
+        cmd_ps,
+        "list every process-compose server on this machine",
+        """\
+Finds servers by their command line. STATE is wt (a wt worktree's stack),
+attached (its terminal is open), detached (its terminal is gone), or dir gone.""",
+        with_json=True,
+    )
+    prune = add(
+        "prune",
+        cmd_prune,
+        "stop servers that run detached or whose dir is gone; wt stacks stay",
+        "Lists the servers and asks before it stops them. Stop wt stacks with `wt down`.",
+    )
+    prune.add_argument("pids", nargs="*", type=int, help="stop these servers instead")
+    prune.add_argument(
+        "-y", "--yes", action="store_true", help="don't ask for confirmation"
+    )
+
+    add(
+        "config",
+        cmd_config,
+        f"describe {CONFIG_FILE}, or print a repo's effective config",
+        "Without -C, prints the reference. With -C DIR, prints that repo's config as JSON.",
+    )
+    add("skills", cmd_skills, "print the directory of the agent skills wt ships")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    try:
+        repo_free = args.command in ("ps", "prune", "skills") or (
+            args.command == "ls" and args.all
+        )
+        if args.command == "config":
+            repo_free = args.directory is None
+        directory = Path(args.directory or ".").resolve()
+        args.repo = None if repo_free else main_checkout(directory)
+        args.handler(args)
+    except WtError as error:
+        sys.exit(f"wt: {error}")
+
+
+if __name__ == "__main__":
+    main()

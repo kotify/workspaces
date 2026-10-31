@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import multiprocessing
+import os
+from pathlib import Path
+
+import pytest
+
+import wt
+
+ROOT = Path("/home/dev/src/app-wt")
+SOCKET = ".direnv/.pc/process-compose.sock"
+
+
+@pytest.mark.parametrize(
+    ("envrc", "port"),
+    [
+        ("export PROJECT_BASE_PORT=8200\nuse flake .\n", 8200),
+        ('export PROJECT_BASE_PORT="8200"\n', 8200),
+        ("PROJECT_BASE_PORT='8200'  # main\n", 8200),
+        ("export PROJECT_BASE_PORT=8200\nexport PROJECT_BASE_PORT=8400\n", 8400),
+        ("export OTHER_BASE_PORT=8200\n", None),
+        ("use flake .\n", None),
+    ],
+)
+def test_parse_port(envrc: str, port: int | None):
+    assert wt.parse_port(envrc, "PROJECT_BASE_PORT") == port
+
+
+def test_set_port_replaces_every_assignment():
+    envrc = 'export A=1\nexport BASE="8200"\nuse flake .\nBASE=1\n'
+
+    updated = wt.set_port(envrc, "BASE", 8300)
+
+    assert updated.startswith("export BASE=8300\n")
+    assert updated.count("BASE=") == 1
+    assert wt.parse_port(updated, "BASE") == 8300
+    assert "export A=1\n" in updated
+    assert "use flake .\n" in updated
+
+
+def test_parse_config_defaults():
+    config = wt.parse_config("")
+
+    assert config == wt.Config()
+    assert config.ports is None
+    assert config.stack is None
+    assert config.git.remote == "origin"
+
+
+def test_parse_config_full():
+    config = wt.parse_config(
+        """
+        [git]
+        base = "origin/develop"
+        fetch = false
+        [install]
+        command = "make install"
+        [ports]
+        var = "BASE_PORT"
+        block = 20
+        [stack]
+        processes = ["db", "cache"]
+        """
+    )
+
+    assert config.git == wt.GitConfig(
+        remote="origin", base="origin/develop", fetch=False
+    )
+    assert config.install == "make install"
+    assert config.ports == wt.PortsConfig(var="BASE_PORT", block=20)
+    assert config.stack is not None
+    assert config.stack.processes == ("db", "cache")
+    assert config.stack.start == "app.start -D"
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        ("[stak]\n", "unknown section stak"),
+        ("[ports]\nbase = 1\n", "unknown key ports.base"),
+        ("[ports]\nblock = '100'\n", "ports.block must be int"),
+        ("[ports]\nblock = true\n", "ports.block must be int"),
+        ("[ports]\nblock = 0\n", "between 1 and 1000"),
+        ("[ports]\nvar = 'not a var'\n", "variable name"),
+        ("[stack]\nprocesses = [1]\n", "list of names"),
+        ("[git\n", ".wt.toml"),
+    ],
+)
+def test_parse_config_rejects_mistakes(text: str, error: str):
+    with pytest.raises(wt.WtError, match=error):
+        wt.parse_config(text)
+
+
+def test_worktree_name_keeps_short_branches():
+    assert wt.worktree_name("feat/Some_branch", ROOT, SOCKET) == "feat-some-branch"
+
+
+def test_worktree_name_shortens_to_fit_the_socket_path():
+    branch = "feat/a-branch-name-that-goes-on-and-on-well-past-the-socket-limit"
+
+    name = wt.worktree_name(branch, ROOT, SOCKET)
+
+    wt.check_name(name, ROOT, SOCKET)
+    assert wt.path_bytes(ROOT / name / SOCKET) <= wt.MAX_SOCKET_PATH
+    assert name != wt.worktree_name(branch + "-2", ROOT, SOCKET)
+
+
+def test_check_name_counts_bytes():
+    root = Path("/home/dev/src/" + "é" * 20 + "-wt")
+    # Fits when the 20 two-byte characters count once, not when they count twice.
+    name = "x" * (wt.MAX_SOCKET_PATH - len(str(root / SOCKET)) - 1)
+
+    with pytest.raises(wt.WtError, match="too long"):
+        wt.check_name(name, root, SOCKET)
+
+
+def test_allocate_port_block_skips_taken_overlapping_and_busy_blocks():
+    taken = [range(8200, 8300), range(8300, 8400), range(8450, 8460)]
+
+    port = wt.allocate_port_block(
+        taken, 100, pool=range(8300, 10000), is_free=lambda block: 8550 not in block
+    )
+
+    # 8300 is taken, 8400 overlaps 8450, and 8500 has a busy port.
+    assert port == 8600
+
+
+def test_allocate_port_block_probes_the_whole_block():
+    probed: list[range] = []
+
+    def is_free(block: range) -> bool:
+        probed.append(block)
+        return True
+
+    wt.allocate_port_block([], 100, pool=range(8300, 10000), is_free=is_free)
+
+    assert probed == [range(8300, 8400)]
+
+
+def test_allocate_port_block_falls_back_to_unaligned_blocks():
+    assert wt.allocate_port_block([], 100, pool=range(8301, 8401), is_free=bool) == 8301
+
+
+def test_allocate_port_block_fails_when_full():
+    with pytest.raises(wt.WtError, match="no free port block"):
+        wt.allocate_port_block(
+            [range(8300, 8500)], 100, pool=range(8300, 8500), is_free=bool
+        )
+
+
+def reserve(state_home: str, index: int) -> int:
+    os.environ["XDG_STATE_HOME"] = state_home
+    with wt.locked_state() as state:
+        port = wt.allocate_port_block(
+            wt.taken_blocks(state), 100, pool=range(8300, 10000), is_free=bool
+        )
+        path = f"/tmp/wt-test/{index}"
+        state.worktrees[path] = wt.Record(
+            repo="/tmp/repo",
+            name=str(index),
+            path=path,
+            branch=str(index),
+            status="creating",
+            created_at=wt.now(),
+            base_port=port,
+            port_block=100,
+        )
+    return port
+
+
+def test_concurrent_allocations_get_distinct_ports(tmp_path: Path):
+    with multiprocessing.get_context("spawn").Pool(8) as pool:
+        ports = pool.starmap(reserve, [(str(tmp_path), i) for i in range(16)])
+
+    assert len(set(ports)) == 16
+
+
+def test_find_is_scoped_to_the_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    for repo in ("/src/api", "/src/web"):
+        with wt.locked_state() as state:
+            record = wt.Record(
+                repo=repo,
+                name="feat-x",
+                path=f"{repo}-wt/feat-x",
+                branch="feat/x",
+                status="ready",
+                created_at=wt.now(),
+            )
+            state.worktrees[record.path] = record
+
+    found = wt.read_state().find(Path("/src/web"), "feat-x")
+
+    assert found.path == "/src/web-wt/feat-x"
+    assert found.label == "web:feat-x"
+
+
+@pytest.mark.parametrize(
+    ("command", "server"),
+    [
+        ("process-compose up -D", True),
+        ("/nix/store/x/bin/process-compose -f pc.yaml", True),
+        ("process-compose run web", True),
+        ("process-compose process list -o json", False),
+        ("process-compose attach", False),
+        ("python process-compose.py up", False),
+        ("process-compose up list", True),
+        ("process-compose -f project up", True),
+        ("process-compose -u /s process list", False),
+    ],
+)
+def test_is_server(command: str, server: bool):
+    assert wt.is_server(command.split()) is server
+
+
+@pytest.mark.parametrize(
+    ("command", "sock"),
+    [
+        ("process-compose --unix-socket /s up", "/s"),
+        ("process-compose --unix-socket=/s up", "/s"),
+        ("process-compose -u /s up", "/s"),
+        ("process-compose up", None),
+    ],
+)
+def test_server_socket(command: str, sock: str | None):
+    assert wt.server_socket(command.split()) == sock
