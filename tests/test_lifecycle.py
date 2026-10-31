@@ -195,3 +195,13 @@ def test_ports_refuse_a_branch_that_tracks_envrc(tmp_path: Path, env: dict[str, 
     assert "tracks .envrc" in refused.stderr
     assert not (tmp_path / "app-wt" / "tracked").exists()
     assert state(env)["worktrees"] == {}
+
+
+def test_rm_forgets_a_worktree_deleted_by_hand(tmp_path: Path, env: dict[str, str]):
+    repo = make_repo(tmp_path, env, config=CONFIG)
+    [created] = json.loads(wt(env, repo, "new", "feat/x", "--json").stdout)
+    shutil.rmtree(created["path"])
+
+    wt(env, repo, "rm", "feat-x")
+
+    wt(env, repo, "new", "feat/x")

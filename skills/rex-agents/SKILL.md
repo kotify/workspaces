@@ -39,5 +39,4 @@ description: Run sub-agents in parallel from one Rex terminal, each in its own `
 - Tell each sub-agent its worktree path, branch, and what "done" means (checks to pass, commit or not, push or not). Sub-agents commit only to their branch and don't push unless the task says so.
 - Before you report that a sub-agent finished, check its exit status or capture and its commits. Report failures with the captured output.
 - Pass `wt rm --force` only when the work is committed elsewhere or the user said to discard it.
-- Run `wt prune` only when the user asks: it can stop stacks of other checkouts and CI runs.
 - Always pass the session ID from `wt rex` or `wt info` to `rex` commands. An empty `-s` falls back to your own session.

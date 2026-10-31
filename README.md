@@ -27,7 +27,7 @@ inputs.workspaces.url = "github:kotify/workspaces";
 packages = [ inputs.workspaces.packages.${system}.default ];
 ```
 
-Without Nix, `wt.py` and `VERSION` are all it needs: Python 3.11 or later, git, and, depending on the features you use, direnv, process-compose, lsof, and ps. It runs on macOS and Linux.
+Without Nix, `wt.py` and `VERSION` are all it needs: Python 3.11 or later, git, and, depending on the features you use, direnv and process-compose. It runs on macOS and Linux.
 
 ## How a repo opts in
 
@@ -73,7 +73,6 @@ Use `wt` only on branches whose authors you'd let run code on your machine. To r
 | `wt down NAME`, `wt logs NAME PROCESS` | Stop the stack; read a process's logs. |
 | `wt exec NAME -- COMMAND` | Run a command in the worktree's directory and environment. |
 | `wt rm NAME [--force]` | If the worktree is clean, close its Rex session, stop its stack, and remove it. |
-| `wt ps`, `wt prune` | List every process-compose server on the machine; stop the ones left behind. |
 | `wt skill install`, `wt skill show NAME` | Install the agent skills `wt` ships; print a skill's guide. |
 | `wt rex NAME [-- COMMAND]` | Open the worktree in a [Rex](https://www.superlogical.com/rex) session, optionally with an agent. |
 

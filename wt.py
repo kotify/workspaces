@@ -32,7 +32,6 @@ import os
 import re
 import shlex
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -55,16 +54,7 @@ STUB_MARKER = "wt-stub"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # sockaddr_un.sun_path is 104 bytes on macOS (108 on Linux), including the trailing NUL.
 MAX_SOCKET_PATH = 103
-FAILED_STATES = ("Completed", "Error", "Skipped", "Terminating")
-CLIENT_COMMANDS = {
-    "analyze", "attach", "completion", "down", "graph", "help", "info", "list",
-    "namespace", "process", "project", "recipe", "version",
-}  # fmt: skip
-# process-compose's global flags that take a separate value.
-VALUE_FLAGS = {
-    "-f", "--config", "-u", "--unix-socket", "-p", "--port", "-a", "--address",
-    "-L", "--log-file", "-n", "--namespace", "-e", "--env", "--ordered-shutdown-timeout",
-}  # fmt: skip
+FAILED_STATES = ("Error", "Skipped", "Terminating")
 
 CONFIG_HELP = f"""\
 A repo describes its worktrees in {CONFIG_FILE} at its root. Every key is optional;
@@ -225,10 +215,22 @@ def parse_config(text: str) -> Config:
 
 
 def load_config(*checkouts: Path) -> Config:
-    """The config of the first checkout that has one, or the defaults."""
-    for checkout in checkouts:
-        with contextlib.suppress(FileNotFoundError):
-            return parse_config((checkout / CONFIG_FILE).read_text())
+    """The config of the first checkout that has a valid one, or the defaults.
+
+    A broken config in a checkout other than the last falls back with a warning, so one
+    branch's mistake, or a key from a newer wt, doesn't stop wt from managing it.
+    """
+    for i, checkout in enumerate(checkouts):
+        try:
+            text = (checkout / CONFIG_FILE).read_text()
+        except FileNotFoundError:
+            continue
+        try:
+            return parse_config(text)
+        except WtError as error:
+            if i == len(checkouts) - 1:
+                raise
+            log(f"wt: ignoring {checkout / CONFIG_FILE}: {error}")
     return Config()
 
 
@@ -329,6 +331,18 @@ def known(values: dict[str, Any], cls: type[Record | Repo]) -> dict[str, Any]:
     """values without the fields a newer or older wt wrote."""
     names = {f.name for f in fields(cls)}
     return {k: v for k, v in values.items() if k in names}
+
+
+@contextlib.contextmanager
+def repo_lock(repo: Path) -> Generator[None]:
+    """Serializes wt's git writes in one repo: concurrent fetches and worktree adds fail
+    on git's own lock files instead of waiting. Don't nest it."""
+    directory = state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(str(repo).encode()).hexdigest()[:12]  # noqa: S324
+    with (directory / f"repo-{digest}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 # Repos and ports.
@@ -537,6 +551,17 @@ def process_state(process: dict[str, Any]) -> str:
     return status
 
 
+def process_outcome(process: dict[str, Any] | None) -> str:
+    """done, failed, or pending, for a process that `wt up` waits on."""
+    if process is None:
+        return "pending"
+    state = process_state(process)
+    if state in FAILED_STATES or process.get("exit_code"):
+        return "failed"
+    # A one-shot process, such as a migration, is done once it exits cleanly.
+    return "done" if state in ("Running", "Completed") else "pending"
+
+
 def stop_stack(record: Record) -> None:
     if processes(record, strict=True) is None:
         return
@@ -679,7 +704,8 @@ def cmd_new(args: argparse.Namespace) -> None:
             )
 
     if config.git.fetch:
-        run(["git", "-C", str(repo), "fetch", "--quiet", config.git.remote])
+        with repo_lock(repo):
+            run(["git", "-C", str(repo), "fetch", "--quiet", config.git.remote])
     base = args.base or default_base(repo, config.git)
     main_port = read_port(repo, config.ports.var) if config.ports else None
     if config.ports and main_port is None:
@@ -757,7 +783,8 @@ def create(
         add = ["--no-track", "-b", record.branch, base]
         record.created_branch = True
     path.parent.mkdir(parents=True, exist_ok=True)
-    run(["git", "-C", str(repo), "worktree", "add", "--quiet", str(path), *add])
+    with repo_lock(repo):
+        run(["git", "-C", str(repo), "worktree", "add", "--quiet", str(path), *add])
     record.start_commit = run(
         ["git", "-C", str(path), "rev-parse", "HEAD"], quiet=True
     ).stdout.strip()
@@ -802,19 +829,20 @@ def create(
 
 def rollback(record: Record) -> None:
     repo, path = Path(record.repo), Path(record.path)
-    if path.exists():
-        run(
-            ["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
-            check=False,
-            quiet=True,
-        )
-        shutil.rmtree(path, ignore_errors=True)
-    if record.created_branch:
-        run(
-            ["git", "-C", str(repo), "branch", "-D", record.branch],
-            check=False,
-            quiet=True,
-        )
+    with repo_lock(repo):
+        if path.exists():
+            run(
+                ["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
+                check=False,
+                quiet=True,
+            )
+            shutil.rmtree(path, ignore_errors=True)
+        if record.created_branch:
+            run(
+                ["git", "-C", str(repo), "branch", "-D", record.branch],
+                check=False,
+                quiet=True,
+            )
     with locked_state() as state:
         state.worktrees.pop(record.path, None)
 
@@ -867,23 +895,22 @@ def cmd_up(args: argparse.Namespace) -> None:
     deadline = time.monotonic() + args.timeout
     while True:
         procs = {p["name"]: p for p in processes(record) or []}
-        states = {name: process_state(p) for name, p in procs.items()}
-        failed = [
-            p
-            for p in wanted
-            if states.get(p) in FAILED_STATES or procs.get(p, {}).get("exit_code")
-        ]
+        outcomes = {p: process_outcome(procs.get(p)) for p in wanted}
+        failed = [p for p in wanted if outcomes[p] == "failed"]
         if failed:
             raise WtError(
                 f"{', '.join(failed)} stopped; see `wt logs {record.name} {failed[0]}`"
             )
-        pending = [p for p in wanted if states.get(p) != "Running"]
+        pending = [p for p in wanted if outcomes[p] == "pending"]
         if not pending:
             break
         if time.monotonic() > deadline:
             raise WtError(
                 f"not ready after {args.timeout}s: "
-                + ", ".join(f"{p} ({states.get(p, 'missing')})" for p in pending)
+                + ", ".join(
+                    f"{p} ({process_state(procs[p]) if p in procs else 'missing'})"
+                    for p in pending
+                )
                 + f"; see `wt logs {record.name} <process>`"
             )
         time.sleep(1)
@@ -1004,154 +1031,22 @@ def cmd_rm(args: argparse.Namespace) -> None:
         stop_stack(record)
         refuse_dirty(path, force=args.force)
         remove = ["git", "-C", record.repo, "worktree", "remove", str(path)]
-        run(remove + (["--force"] if args.force else []))
+        with repo_lock(Path(record.repo)):
+            run(remove + (["--force"] if args.force else []))
     elif path.exists():
         # A `wt new` that died: nothing in it is the user's yet.
         rollback(record)
         log(f"Removed the unfinished worktree {path}")
         return
+    if not path.exists():
+        # Deleted by hand: git still counts its branch as checked out until it prunes.
+        with repo_lock(Path(record.repo)):
+            run(
+                ["git", "-C", record.repo, "worktree", "prune"], check=False, quiet=True
+            )
     with locked_state() as state:
         state.worktrees.pop(record.path, None)
     log(f"Removed {path}; the branch {record.branch} stays")
-
-
-# Servers: every process-compose server on the machine.
-
-
-@dataclass(frozen=True)
-class Server:
-    pid: int
-    ppid: int
-    age: str
-    socket: str | None
-    cwd: Path | None
-
-    @property
-    def detached(self) -> bool:
-        return self.ppid == 1
-
-    @property
-    def gone(self) -> bool:
-        return self.cwd is None or not self.cwd.is_dir()
-
-    def state(self, managed: set[str]) -> str:
-        if self.gone:
-            return "dir gone"
-        if str(self.cwd) in managed:
-            return "wt"
-        return "detached" if self.detached else "attached"
-
-    def describe(self, managed: set[str]) -> dict[str, Any]:
-        return {
-            "pid": self.pid,
-            "age": self.age,
-            "state": self.state(managed),
-            "dir": str(self.cwd) if self.cwd else None,
-        }
-
-
-def process_cwd(pid: int) -> Path | None:
-    result = run(
-        ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], check=False, quiet=True
-    )
-    for line in result.stdout.splitlines():
-        if line.startswith("n"):
-            return Path(line[1:])
-    return None
-
-
-def server_socket(argv: list[str]) -> str | None:
-    for i, arg in enumerate(argv):
-        if arg in ("-u", "--unix-socket") and i + 1 < len(argv):
-            return argv[i + 1]
-        if arg.startswith("--unix-socket="):
-            return arg.split("=", 1)[1]
-    return None
-
-
-def is_server(argv: list[str]) -> bool:
-    """A process-compose server: its command is `up`, `run`, or absent."""
-    if Path(argv[0]).name != "process-compose":
-        return False
-    args = iter(argv[1:])
-    for arg in args:
-        if arg in VALUE_FLAGS:
-            next(args, None)
-        elif not arg.startswith("-"):
-            return arg not in CLIENT_COMMANDS
-    return True
-
-
-def servers() -> list[Server]:
-    ps = run(["ps", "-axo", "pid=,ppid=,etime=,command="], quiet=True)
-    found: list[Server] = []
-    for line in ps.stdout.splitlines():
-        pid, ppid, age, command = line.split(None, 3)
-        try:
-            argv = shlex.split(command)
-        except ValueError:
-            continue
-        if is_server(argv):
-            cwd = process_cwd(int(pid))
-            found.append(Server(int(pid), int(ppid), age, server_socket(argv), cwd))
-    return found
-
-
-def print_servers(
-    found: list[Server], managed: set[str], *, as_json: bool = False
-) -> None:
-    described = [server.describe(managed) for server in found]
-    if as_json:
-        print(json.dumps(described, indent=2))
-        return
-    print(f"{'PID':>7}  {'AGE':>12}  {'STATE':<9}  DIR")
-    for s in described:
-        print(f"{s['pid']:>7}  {s['age']:>12}  {s['state']:<9}  {s['dir'] or '?'}")
-
-
-def stop_server(server: Server) -> None:
-    if server.socket and Path(server.socket).exists():
-        run(
-            ["process-compose", "--unix-socket", server.socket, "--use-uds", "down"],
-            check=False,
-            quiet=True,
-        )
-    else:
-        # Started without a socket API: SIGTERM also stops its processes.
-        os.kill(server.pid, signal.SIGTERM)
-    for _ in range(60):
-        try:
-            os.kill(server.pid, 0)
-        except ProcessLookupError:
-            log(f"Stopped {server.pid} ({server.cwd or '?'})")
-            return
-        time.sleep(1)
-    log(f"{server.pid} is still running after 60s")
-
-
-def managed_paths() -> set[str]:
-    return set(read_state().worktrees)
-
-
-def cmd_ps(args: argparse.Namespace) -> None:
-    print_servers(servers(), managed_paths(), as_json=args.json)
-
-
-def cmd_prune(args: argparse.Namespace) -> None:
-    found, managed = servers(), managed_paths()
-    targets = (
-        [s for s in found if s.pid in args.pids]
-        if args.pids
-        else [s for s in found if s.gone or (s.detached and s.state(managed) != "wt")]
-    )
-    if not targets:
-        log("Nothing to stop.")
-        return
-    print_servers(targets, managed)
-    if not args.yes and input("\nStop these? [y/N] ").strip().lower() != "y":
-        return
-    for server in targets:
-        stop_server(server)
 
 
 def cmd_config(args: argparse.Namespace) -> None:
@@ -1377,26 +1272,6 @@ also apply. Removes a worktree whose `wt new` died.""",
     rm.add_argument("--force", action="store_true", help="discard uncommitted changes")
 
     add(
-        "ps",
-        cmd_ps,
-        "list every process-compose server on this machine",
-        """\
-Finds servers by their command line. STATE is wt (a wt worktree's stack),
-attached (its terminal is open), detached (its terminal is gone), or dir gone.""",
-        with_json=True,
-    )
-    prune = add(
-        "prune",
-        cmd_prune,
-        "stop servers that run detached or whose dir is gone; wt stacks stay",
-        "Lists the servers and asks before it stops them. Stop wt stacks with `wt down`.",
-    )
-    prune.add_argument("pids", nargs="*", type=int, help="stop these servers instead")
-    prune.add_argument(
-        "-y", "--yes", action="store_true", help="don't ask for confirmation"
-    )
-
-    add(
         "config",
         cmd_config,
         f"describe {CONFIG_FILE}, or print a repo's effective config",
@@ -1426,9 +1301,7 @@ act on every skill wt ships: {", ".join(skill_names())}.""",
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        repo_free = args.command in ("ps", "prune", "skill") or (
-            args.command == "ls" and args.all
-        )
+        repo_free = args.command == "skill" or (args.command == "ls" and args.all)
         if args.command == "config":
             repo_free = args.directory is None
         directory = Path(args.directory or ".").resolve()

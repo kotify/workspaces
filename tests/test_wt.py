@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -202,37 +203,6 @@ def test_find_is_scoped_to_the_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert found.label == "web:feat-x"
 
 
-@pytest.mark.parametrize(
-    ("command", "server"),
-    [
-        ("process-compose up -D", True),
-        ("/nix/store/x/bin/process-compose -f pc.yaml", True),
-        ("process-compose run web", True),
-        ("process-compose process list -o json", False),
-        ("process-compose attach", False),
-        ("python process-compose.py up", False),
-        ("process-compose up list", True),
-        ("process-compose -f project up", True),
-        ("process-compose -u /s process list", False),
-    ],
-)
-def test_is_server(command: str, server: bool):
-    assert wt.is_server(command.split()) is server
-
-
-@pytest.mark.parametrize(
-    ("command", "sock"),
-    [
-        ("process-compose --unix-socket /s up", "/s"),
-        ("process-compose --unix-socket=/s up", "/s"),
-        ("process-compose -u /s up", "/s"),
-        ("process-compose up", None),
-    ],
-)
-def test_server_socket(command: str, sock: str | None):
-    assert wt.server_socket(command.split()) == sock
-
-
 def save(record: wt.Record) -> None:
     with wt.locked_state() as state:
         state.worktrees[record.path] = record
@@ -347,3 +317,38 @@ def test_skill_install_and_remove_leave_other_skills_alone(tmp_path: Path):
     assert "--force" in refused.stderr
     assert own.read_text() == "my own skill"
     assert not (tmp_path / ".agents" / "skills" / "rex-agents").exists()
+
+
+def test_config_falls_back_to_the_main_checkout_when_the_branch_copy_is_broken(
+    tmp_path: Path,
+):
+    repo, path = tmp_path / "app", tmp_path / "app-wt" / "feat-x"
+    for checkout, text in ((repo, '[install]\ncommand = "main"\n'), (path, "[nope]\n")):
+        checkout.mkdir(parents=True)
+        (checkout / ".wt.toml").write_text(text)
+    record = wt.Record(
+        repo=str(repo),
+        name="feat-x",
+        path=str(path),
+        branch="feat/x",
+        status="ready",
+        created_at=wt.now(),
+    )
+
+    assert record.config().install == "main"
+
+
+@pytest.mark.parametrize(
+    ("process", "outcome"),
+    [
+        ({"status": "Running", "is_ready": "Ready"}, "done"),
+        ({"status": "Running", "is_ready": "Not Ready"}, "pending"),
+        ({"status": "Pending"}, "pending"),
+        ({"status": "Completed", "exit_code": 0}, "done"),
+        ({"status": "Completed", "exit_code": 1}, "failed"),
+        ({"status": "Error"}, "failed"),
+        (None, "pending"),
+    ],
+)
+def test_process_outcome(process: dict[str, Any] | None, outcome: str):
+    assert wt.process_outcome(process) == outcome

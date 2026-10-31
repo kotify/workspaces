@@ -46,15 +46,11 @@
             makeWrapper ${pkgs.python3}/bin/python3 $out/bin/wt \
               --add-flags $out/share/wt/wt.py \
               --suffix PATH : ${
-                lib.makeBinPath (
-                  [
-                    pkgs.git
-                    pkgs.direnv
-                    pkgs.process-compose
-                    pkgs.lsof
-                  ]
-                  ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.procps ]
-                )
+                lib.makeBinPath [
+                  pkgs.git
+                  pkgs.direnv
+                  pkgs.process-compose
+                ]
               }
           '';
           meta = {
