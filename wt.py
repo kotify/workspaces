@@ -39,7 +39,7 @@ import sys
 import time
 import tomllib
 from collections.abc import Callable, Generator
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -47,6 +47,11 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 VERSION = (HERE / "VERSION").read_text().strip()
 CONFIG_FILE = ".wt.toml"
+# Bump only when older wt versions can't read the new state; unknown fields are dropped.
+STATE_VERSION = 1
+# Where agents look for user skills: Claude Code, then Codex and other agents.
+AGENT_SKILL_DIRS = ("~/.claude/skills", "~/.agents/skills")
+STUB_MARKER = "wt-stub"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # sockaddr_un.sun_path is 104 bytes on macOS (108 on Linux), including the trailing NUL.
 MAX_SOCKET_PATH = 103
@@ -293,6 +298,7 @@ def locked_state() -> Generator[State]:
         tmp.write_text(
             json.dumps(
                 {
+                    "version": STATE_VERSION,
                     "worktrees": {k: asdict(v) for k, v in state.worktrees.items()},
                     "repos": {k: asdict(v) for k, v in state.repos.items()},
                 },
@@ -307,12 +313,22 @@ def read_state() -> State:
         raw: dict[str, Any] = json.loads((state_dir() / "state.json").read_text())
     except FileNotFoundError:
         raw = {}
+    if raw.get("version", 1) > STATE_VERSION:
+        raise WtError(
+            f"{state_dir() / 'state.json'} was written by a newer wt; upgrade wt"
+        )
     worktrees: dict[str, dict[str, Any]] = raw.get("worktrees", {})
     repos: dict[str, dict[str, Any]] = raw.get("repos", {})
     return State(
-        worktrees={path: Record(**fields) for path, fields in worktrees.items()},
-        repos={path: Repo(**fields) for path, fields in repos.items()},
+        worktrees={path: Record(**known(v, Record)) for path, v in worktrees.items()},
+        repos={path: Repo(**known(v, Repo)) for path, v in repos.items()},
     )
+
+
+def known(values: dict[str, Any], cls: type[Record | Repo]) -> dict[str, Any]:
+    """values without the fields a newer or older wt wrote."""
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in values.items() if k in names}
 
 
 # Repos and ports.
@@ -968,19 +984,25 @@ def cmd_rex(args: argparse.Namespace) -> None:
     print(json.dumps({"session_id": session_id, "blocks": blocks}, indent=2))
 
 
+def refuse_dirty(path: Path, *, force: bool) -> None:
+    dirty = run(["git", "-C", str(path), "status", "--porcelain"], quiet=True)
+    if dirty.stdout.strip() and not force:
+        raise WtError(
+            f"{path} has uncommitted changes; commit them or pass --force:\n"
+            f"{dirty.stdout.rstrip()}"
+        )
+
+
 def cmd_rm(args: argparse.Namespace) -> None:
     record = read_state().find(args.repo, args.name)
     path = Path(record.path)
     if record.status == "ready" and path.exists():
-        # Agents and the stack stop first, so nothing writes after the dirty check.
+        # Checked before and after stopping: a dirty worktree keeps its agents and stack,
+        # and nothing can write after the second check.
+        refuse_dirty(path, force=args.force)
         close_rex_session(record)
         stop_stack(record)
-        dirty = run(["git", "-C", str(path), "status", "--porcelain"], quiet=True)
-        if dirty.stdout.strip() and not args.force:
-            raise WtError(
-                f"{path} has uncommitted changes; its session and stack are stopped. "
-                f"Commit them or pass --force:\n{dirty.stdout.rstrip()}"
-            )
+        refuse_dirty(path, force=args.force)
         remove = ["git", "-C", record.repo, "worktree", "remove", str(path)]
         run(remove + (["--force"] if args.force else []))
     elif path.exists():
@@ -1139,8 +1161,77 @@ def cmd_config(args: argparse.Namespace) -> None:
     print(json.dumps(asdict(load_config(args.repo)), indent=2))
 
 
-def cmd_skills(args: argparse.Namespace) -> None:
-    print(HERE / "skills")
+def shipped_skill(name: str) -> tuple[str, str]:
+    """The frontmatter and guide of a skill wt ships."""
+    try:
+        text = (HERE / "skills" / name / "SKILL.md").read_text()
+    except FileNotFoundError:
+        raise WtError(
+            f"no skill {name!r}; wt ships {', '.join(skill_names())}"
+        ) from None
+    match = re.match(r"---\n(.*?)\n---\n+", text, re.DOTALL)
+    if match is None:
+        raise WtError(f"skill {name!r} has no frontmatter")
+    return match[1], text[match.end() :]
+
+
+def skill_names() -> list[str]:
+    return sorted(p.parent.name for p in (HERE / "skills").glob("*/SKILL.md"))
+
+
+def skill_stub(name: str) -> str:
+    """A SKILL.md that loads the guide from the wt on PATH, so it never goes stale."""
+    frontmatter, _ = shipped_skill(name)
+    return f"""\
+---
+{frontmatter}
+metadata:
+  {STUB_MARKER}: "1"
+---
+<!-- Installed by `wt skill install`. Remove it with `wt skill remove`. -->
+
+Run `wt skill show {name}` and follow the guide it prints. The guide comes from the `wt`
+on PATH, so it matches that version.
+"""
+
+
+def is_stub(path: Path) -> bool:
+    return path.is_file() and f"\n  {STUB_MARKER}:" in path.read_text()
+
+
+def cmd_skill(args: argparse.Namespace) -> None:
+    if args.action == "show":
+        if args.name is None:
+            raise WtError(f"name a skill: {', '.join(skill_names())}")
+        sys.stdout.write(shipped_skill(args.name)[1])
+        return
+    names = [args.name] if args.name else skill_names()
+    stubs = {name: skill_stub(name) for name in names}
+    dirs = [Path(d).expanduser() for d in args.dir or AGENT_SKILL_DIRS]
+    targets = [(d / name, name) for d in dirs for name in names]
+    if args.action == "remove":
+        for target, _ in targets:
+            if is_stub(target / "SKILL.md"):
+                (target / "SKILL.md").unlink()
+                with contextlib.suppress(OSError):
+                    target.rmdir()
+                log(f"Removed {target}")
+        return
+    # Checked before writing anything, so a refusal leaves every agent as it was.
+    if not args.force:
+        for target, _ in targets:
+            if (target.exists() or target.is_symlink()) and not is_stub(
+                target / "SKILL.md"
+            ):
+                raise WtError(
+                    f"{target} isn't a skill wt installed; pass --force to replace it"
+                )
+    for target, name in targets:
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "SKILL.md").write_text(stubs[name])
+        log(f"Installed {target}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1185,7 +1276,11 @@ checks the effective value. Then runs `direnv allow` and install.command.
 Parallel runs are safe. On failure it removes what it created.
 The name is --name, or the branch with `/` replaced by `-`, shortened with a hash
 when the stack's socket path would exceed the macOS limit. See `wt config` for
-{CONFIG_FILE}.""",
+{CONFIG_FILE}.
+
+The worktree runs the branch's code: its .envrc setup, {CONFIG_FILE}, and install
+scripts run now, and `wt up` and `wt exec` run the rest. Use wt only on branches
+whose authors you'd let run code on this machine.""",
         with_json=True,
     )
     new.add_argument(
@@ -1273,9 +1368,10 @@ Example: wt rex feat-x -- claude -p --permission-mode acceptEdits "$(cat task.md
         cmd_rm,
         "close the session, stop the stack, remove the worktree; keep the branch",
         """\
-Closes the worktree's Rex session and stops its stack first, then refuses when
-the worktree has uncommitted or untracked changes unless --force. Without
---force, git's own checks also apply. Removes a worktree whose `wt new` died.""",
+Refuses when the worktree has uncommitted or untracked changes unless --force,
+before it touches anything. Then closes the worktree's Rex session, stops its
+stack, checks again, and removes the worktree. Without --force, git's own checks
+also apply. Removes a worktree whose `wt new` died.""",
     )
     rm.add_argument("name")
     rm.add_argument("--force", action="store_true", help="discard uncommitted changes")
@@ -1306,14 +1402,31 @@ attached (its terminal is open), detached (its terminal is gone), or dir gone.""
         f"describe {CONFIG_FILE}, or print a repo's effective config",
         "Without -C, prints the reference. With -C DIR, prints that repo's config as JSON.",
     )
-    add("skills", cmd_skills, "print the directory of the agent skills wt ships")
+    skill = add(
+        "skill",
+        cmd_skill,
+        "install the agent skills wt ships, or print one",
+        f"""\
+install writes a stub SKILL.md for each skill into {" and ".join(AGENT_SKILL_DIRS)},
+or into each --dir, such as a repo's .agents/skills. The stub tells the agent to
+run `wt skill show NAME`, so the guide always matches the wt on PATH. install
+refuses to replace a skill it didn't write unless --force; remove deletes only
+the stubs it wrote. show prints a skill's guide. Without NAME, install and remove
+act on every skill wt ships: {", ".join(skill_names())}.""",
+    )
+    skill.add_argument("action", choices=["install", "remove", "show"])
+    skill.add_argument("name", nargs="?", help="a skill wt ships")
+    skill.add_argument("--dir", action="append", help="a skills directory (repeatable)")
+    skill.add_argument(
+        "--force", action="store_true", help="replace a skill wt didn't install"
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        repo_free = args.command in ("ps", "prune", "skills") or (
+        repo_free = args.command in ("ps", "prune", "skill") or (
             args.command == "ls" and args.all
         )
         if args.command == "config":

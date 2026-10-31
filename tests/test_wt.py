@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import argparse
+import json
 import multiprocessing
 import os
+import subprocess
+import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -9,6 +14,7 @@ import pytest
 import wt
 
 ROOT = Path("/home/dev/src/app-wt")
+WT = Path(wt.__file__)
 SOCKET = ".direnv/.pc/process-compose.sock"
 
 
@@ -225,3 +231,119 @@ def test_is_server(command: str, server: bool):
 )
 def test_server_socket(command: str, sock: str | None):
     assert wt.server_socket(command.split()) == sock
+
+
+def save(record: wt.Record) -> None:
+    with wt.locked_state() as state:
+        state.worktrees[record.path] = record
+
+
+def test_rm_refuses_a_dirty_worktree_before_stopping_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    path = tmp_path / "app-wt" / "feat-x"
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+    (path / "scratch").write_text("work")
+    save(
+        wt.Record(
+            repo=str(tmp_path / "app"),
+            name="feat-x",
+            path=str(path),
+            branch="feat/x",
+            status="ready",
+            created_at=wt.now(),
+        )
+    )
+    stopped: list[str] = []
+
+    def stop(what: str) -> Callable[[wt.Record], None]:
+        return lambda record: stopped.append(what)
+
+    monkeypatch.setattr(wt, "close_rex_session", stop("rex"))
+    monkeypatch.setattr(wt, "stop_stack", stop("stack"))
+
+    with pytest.raises(wt.WtError, match="scratch"):
+        wt.cmd_rm(argparse.Namespace(repo=tmp_path / "app", name="feat-x", force=False))
+
+    assert stopped == []
+
+
+def test_read_state_drops_unknown_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    (tmp_path / "wt").mkdir()
+    (tmp_path / "wt" / "state.json").write_text(
+        json.dumps(
+            {
+                "worktrees": {
+                    "/src/api-wt/x": {
+                        "repo": "/src/api",
+                        "name": "x",
+                        "path": "/src/api-wt/x",
+                        "branch": "x",
+                        "status": "ready",
+                        "created_at": "2026-10-31T00:00:00+00:00",
+                        "retired_field": 1,
+                    }
+                },
+                "repos": {"/src/api": {"base_port": 8200, "retired_field": 1}},
+            }
+        )
+    )
+
+    state = wt.read_state()
+
+    assert state.worktrees["/src/api-wt/x"].name == "x"
+    assert state.repos["/src/api"].base_port == 8200
+
+
+def test_read_state_refuses_a_newer_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    (tmp_path / "wt").mkdir()
+    (tmp_path / "wt" / "state.json").write_text(
+        json.dumps({"version": wt.STATE_VERSION + 1})
+    )
+
+    with pytest.raises(wt.WtError, match="newer wt"):
+        wt.read_state()
+
+
+def skill(*args: str, home: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(WT), "skill", *args],
+        env={**os.environ, "HOME": str(home)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_skill_install_writes_stubs_that_show_the_shipped_guide(tmp_path: Path):
+    installed = skill("install", home=tmp_path)
+
+    assert installed.returncode == 0, installed.stderr
+    for agent in (".claude", ".agents"):
+        stub = (tmp_path / agent / "skills" / "rex-agents" / "SKILL.md").read_text()
+        assert "name: rex-agents" in stub
+        assert "Run `wt skill show rex-agents`" in stub
+    guide = skill("show", "rex-agents", home=tmp_path).stdout
+    assert guide.startswith("`wt` owns the worktree lifecycle")
+
+
+def test_skill_install_and_remove_leave_other_skills_alone(tmp_path: Path):
+    own = tmp_path / ".claude" / "skills" / "rex-agents" / "SKILL.md"
+    own.parent.mkdir(parents=True)
+    own.write_text("my own skill")
+
+    refused = skill("install", home=tmp_path)
+    skill("remove", home=tmp_path)
+
+    assert refused.returncode != 0
+    assert "--force" in refused.stderr
+    assert own.read_text() == "my own skill"
+    assert not (tmp_path / ".agents" / "skills" / "rex-agents").exists()

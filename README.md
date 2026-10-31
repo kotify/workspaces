@@ -57,6 +57,12 @@ socket = ".direnv/.pc/process-compose.sock"
 
 A Nix flake built with [process-compose-flake](https://github.com/Platonic-Systems/process-compose-flake) and [services-flake](https://github.com/juspay/services-flake) fits the contract with little work: derive ports from the variable, keep service data under the project directory, and put the socket under `.direnv/`.
 
+## Trust
+
+A worktree runs its branch's code. `wt new` runs `direnv allow` and the install command, so the branch's `.envrc` setup (for example its `flake.nix`), its `.wt.toml`, and its package scripts run right away, and `wt up` and `wt exec` run whatever the branch contains. This is what `git checkout` and direnv already do in your main checkout: nix-direnv re-evaluates a changed `flake.nix` without asking. `wt` has no trust step of its own, because one that runs once would miss the code that later pulls bring in.
+
+Use `wt` only on branches whose authors you'd let run code on your machine. To review anyone else's branch, read it with `git fetch` and `git diff` in the main checkout, which runs nothing. Run code from strangers, such as fork pull requests, only in an isolated environment without your credentials.
+
 ## Commands
 
 | Command | What it does |
@@ -66,19 +72,20 @@ A Nix flake built with [process-compose-flake](https://github.com/Platonic-Syste
 | `wt up NAME [PROCESS...]` | Start the stack's default processes and the named ones (`--only`: just the named), and wait until they run; fail fast when one stops. |
 | `wt down NAME`, `wt logs NAME PROCESS` | Stop the stack; read a process's logs. |
 | `wt exec NAME -- COMMAND` | Run a command in the worktree's directory and environment. |
-| `wt rm NAME [--force]` | Close the Rex session, stop the stack, then remove the worktree if it's clean. |
+| `wt rm NAME [--force]` | If the worktree is clean, close its Rex session, stop its stack, and remove it. |
 | `wt ps`, `wt prune` | List every process-compose server on the machine; stop the ones left behind. |
+| `wt skill install`, `wt skill show NAME` | Install the agent skills `wt` ships; print a skill's guide. |
 | `wt rex NAME [-- COMMAND]` | Open the worktree in a [Rex](https://www.superlogical.com/rex) session, optionally with an agent. |
 
 `-C DIR` before the command acts on another repo. `--json` prints machine-readable output. `wt COMMAND --help` has the details.
 
 ## Agents
 
-`wt` is built to be driven by coding agents. Each command's help is written for them, and `wt skills` prints the directory of the agent skills it ships:
+`wt` is built to be driven by coding agents. Each command's help is written for them, and it ships agent skills:
 
 - `rex-agents`: run sub-agents in parallel, each in its own worktree and Rex session, from one orchestrating agent.
 
-Install a skill by linking it into your agent's skills directory, for example `ln -s "$(wt skills)/rex-agents" ~/.claude/skills/rex-agents`.
+`wt skill install` installs them for Claude Code (`~/.claude/skills`) and for Codex and other agents (`~/.agents/skills`); `--dir` picks another directory, such as a repo's `.agents/skills`. It writes a short stub that runs `wt skill show NAME`, so the guide always matches the `wt` on `PATH`, including the version a repo pins. `wt skill remove` removes the stubs.
 
 ## Development
 
