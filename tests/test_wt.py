@@ -266,8 +266,11 @@ def test_rm_refuses_while_wt_new_is_still_creating(
 
     with pytest.raises(wt.WtError, match="still creating"):
         rm(tmp_path)
-
     assert Path(record.path).exists()
+
+    # The pid may belong to another process by now; --force trusts the user.
+    rm(tmp_path, force=True)
+    assert not Path(record.path).exists()
 
 
 def test_rm_closes_the_rex_session_of_a_worktree_deleted_by_hand(
@@ -285,16 +288,6 @@ def test_rm_closes_the_rex_session_of_a_worktree_deleted_by_hand(
     rm(tmp_path)
 
     assert closed == ["session:1"]
-
-
-def test_socket_path_prefers_the_socket_the_stack_started_on(tmp_path: Path):
-    started = tmp_path / "started.sock"
-    started.touch()
-    record = record_at(tmp_path, socket=str(started))
-    Path(record.path).mkdir(parents=True)
-    (Path(record.path) / ".wt.toml").write_text('[stack]\nsocket = "other.sock"\n')
-
-    assert wt.socket_path(record) == started
 
 
 def test_stop_stack_fails_when_the_server_stops_answering(
@@ -471,6 +464,7 @@ def test_config_falls_back_to_the_main_checkout_when_the_branch_copy_is_broken(
         ({"status": "Pending"}, "pending"),
         ({"status": "Completed", "exit_code": 0}, "done"),
         ({"status": "Completed", "exit_code": 1}, "failed"),
+        ({"status": "Running", "exit_code": 1, "restarts": 1}, "done"),
         ({"status": "Error"}, "failed"),
         (None, "pending"),
     ],

@@ -263,7 +263,6 @@ class Record:
     created_branch: bool = False
     rex_session: str | None = None
     pid: int | None = None  # the `wt new` creating it
-    socket: str | None = None  # where `wt up` last started the stack
 
     @property
     def repo_name(self) -> str:
@@ -534,18 +533,8 @@ def exec_argv(path: str, command: list[str]) -> list[str]:
 
 
 def socket_path(record: Record) -> Path | None:
-    """The stack's socket: where `wt up` started it, or where the config says.
-
-    The recorded one comes first, so a branch that changes stack.socket, or a broken
-    config, can't make a running stack look stopped.
-    """
     stack = record.config().stack
-    candidates = [Path(record.socket)] if record.socket else []
-    if stack is not None:
-        candidates.append(Path(record.path) / stack.socket)
-    if not candidates:
-        return None
-    return next((c for c in candidates if c.exists()), candidates[0])
+    return None if stack is None else Path(record.path) / stack.socket
 
 
 def process_compose(record: Record, *args: str) -> subprocess.CompletedProcess[str]:
@@ -598,7 +587,9 @@ def process_outcome(process: dict[str, Any] | None) -> str:
     if process is None:
         return "pending"
     state = process_state(process)
-    if state in FAILED_STATES or process.get("exit_code"):
+    # A running process keeps the exit code of its last run until it exits again.
+    stopped = state not in ("Running", "Starting", "Launching", "Pending")
+    if state in FAILED_STATES or (stopped and process.get("exit_code")):
         return "failed"
     # A one-shot process, such as a migration, is done once it exits cleanly.
     return "done" if state in ("Running", "Completed") else "pending"
@@ -939,9 +930,6 @@ def cmd_up(args: argparse.Namespace) -> None:
     path = Path(record.path)
     if processes(record) is None:
         log(f"Starting {', '.join(wanted)} in {path}")
-        with locked_state() as state:
-            record.socket = str(path / stack.socket)
-            state.worktrees[record.path].socket = record.socket
         run(exec_argv(str(path), [*shlex.split(stack.start), *wanted]), cwd=path)
     else:
         for process in wanted:
@@ -1098,11 +1086,13 @@ def alive(pid: int) -> bool:
 def cmd_rm(args: argparse.Namespace) -> None:
     record = read_state().find(args.repo, args.name)
     path = Path(record.path)
-    if record.status == "creating" and record.pid is not None and alive(record.pid):
+    creating = record.status == "creating" and record.pid is not None
+    if creating and not args.force and alive(record.pid or 0):
         raise WtError(
-            f"`wt new` (pid {record.pid}) is still creating {record.label}; wait for it "
-            "or stop it first"
+            f"`wt new` (pid {record.pid}) is still creating {record.label}; wait for it. "
+            "If no `wt new` runs anymore, its pid was reused: pass --force"
         )
+    deleted_by_hand = not path.exists()
     if record.status == "ready" and path.exists():
         # Checked before and after stopping: a dirty worktree keeps its agents and stack,
         # and nothing can write after the second check.
@@ -1118,9 +1108,9 @@ def cmd_rm(args: argparse.Namespace) -> None:
         rollback(record)
         log(f"Removed the unfinished worktree {path}")
         return
-    if not path.exists():
+    if deleted_by_hand:
         close_rex_session(record)
-        # Deleted by hand: git still counts its branch as checked out until it prunes.
+        # Git still counts the branch as checked out there until it prunes.
         with repo_lock(Path(record.repo)):
             run(
                 ["git", "-C", record.repo, "worktree", "prune"], check=False, quiet=True
@@ -1351,7 +1341,11 @@ stack, checks again, and removes the worktree. Without --force, git's own checks
 also apply. Removes a worktree whose `wt new` stopped, and refuses while it runs.""",
     )
     rm.add_argument("name")
-    rm.add_argument("--force", action="store_true", help="discard uncommitted changes")
+    rm.add_argument(
+        "--force",
+        action="store_true",
+        help="discard uncommitted changes; remove even if `wt new` seems to run",
+    )
 
     add(
         "config",
