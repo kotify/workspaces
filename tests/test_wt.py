@@ -489,3 +489,48 @@ def test_up_failure_points_at_the_dependency_that_failed():
     assert message == (
         "postgres stopped; postgres-init failed: see `wt logs sentry postgres-init`"
     )
+
+
+def parse_rex(*argv: str) -> argparse.Namespace:
+    args = wt.build_parser().parse_args(["rex", *argv])
+    args.argv = ["rex", *argv]
+    return args
+
+
+@pytest.mark.parametrize(
+    ("tail", "offender"),
+    [
+        (["--json", "--", "claude"], "--json"),
+        (["-x", "--", "claude"], "-x"),
+        (["stray", "--", "claude"], "stray"),
+        (["claude", "--model", "opus"], "claude"),
+    ],
+)
+def test_rex_rejects_arguments_before_the_dashes_before_touching_anything(
+    monkeypatch: pytest.MonkeyPatch, tail: list[str], offender: str
+):
+    def touched(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("wt rex looked at a worktree or Rex before validating")
+
+    monkeypatch.setattr(wt, "ready_record", touched)
+    monkeypatch.setattr(wt, "rex_session_ids", touched)
+    monkeypatch.setattr(wt, "rex", touched)
+    args = parse_rex("feat-x", *tail)
+    args.repo = ROOT
+
+    with pytest.raises(wt.WtError) as error:
+        wt.cmd_rex(args)
+
+    assert repr(offender) in str(error.value)
+    assert "wt rex NAME -- COMMAND" in str(error.value)
+
+
+def test_rex_passes_options_after_the_dashes_to_the_command_untouched():
+    command = ["claude", "--model", "opus", "--permission-mode", "auto", "do it"]
+
+    assert wt.rex_agent_command(parse_rex("feat-x", "--", *command)) == command
+    kept = parse_rex("feat-x", "--", *command)
+    kept.agent = ["--", *command]  # argparse versions that keep the leading `--`
+    assert wt.rex_agent_command(kept) == command
+    assert wt.rex_agent_command(parse_rex("feat-x")) == []
+    assert wt.rex_agent_command(parse_rex("feat-x", "--")) == []

@@ -1000,6 +1000,23 @@ def strip_dashes(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def rex_agent_command(args: argparse.Namespace) -> list[str]:
+    """The COMMAND of `wt rex NAME -- COMMAND`; anything between NAME and `--` is an error.
+
+    argparse drops a leading `--` from the remainder, so the raw argv tells whether the
+    command came after it.
+    """
+    agent: list[str] = args.agent
+    if agent[:1] == ["--"]:  # some argparse versions keep it, others drop it
+        return agent[1:]
+    if agent and args.argv[-len(agent) - 1 :][:1] != ["--"]:
+        raise WtError(
+            f"unexpected argument {agent[0]!r} after NAME; "
+            "put the command after `--`: wt rex NAME -- COMMAND"
+        )
+    return agent
+
+
 def cmd_exec(args: argparse.Namespace) -> None:
     record = ready_record(args.repo, args.name)
     command = strip_dashes(args.command)
@@ -1014,11 +1031,11 @@ def cmd_exec(args: argparse.Namespace) -> None:
 
 
 def cmd_rex(args: argparse.Namespace) -> None:
+    agent = rex_agent_command(args)
     record = ready_record(args.repo, args.name)
     sessions = rex_session_ids()
     if sessions is None:
         raise WtError("`wt rex` needs a running Rex server and the rex CLI")
-    agent = strip_dashes(args.agent)
     path = record.path
     # Panes run through exec_argv because Rex starts them in the login shell's environment,
     # without the worktree's.
@@ -1388,7 +1405,9 @@ act on every skill wt ships: {", ".join(skill_names())}.""",
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    argv = sys.argv[1:]
+    args = build_parser().parse_args(argv)
+    args.argv = argv
     try:
         repo_free = args.command == "skill" or (args.command == "ls" and args.all)
         if args.command == "config":
